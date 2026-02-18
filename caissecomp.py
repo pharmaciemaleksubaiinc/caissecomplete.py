@@ -1,13 +1,13 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# Report-style UI rewrite:
-# - Condensed bordered "report" grid
-# - Inputs look like plain cells
-# - Mode dropdown: Ouverture normale / Fermeture non effectuée
-# - RETRAIT editable in-table (locks when user edits)
+# FULL rewrite (report style + fixed borders + +/- in RETRAIT)
+# - Auth
+# - Mode dropdown (Ouverture normale / Fermeture non effectuée)
+# - Report-like condensed grid with continuous borders (NO interrupted lines)
+# - RETRAIT editable IN-table with [-] [value] [+] (ATM vibe)
 # - Boîte headers: OPEN / AJOUTÉ / RETRAIT (en change) / RESTANT
-# - No st.data_editor, no nested columns, no reset-to-0 bug
-# - Receipts + daily saved state
+# - No st.data_editor, no nested-columns error, no reset-to-0 "enter" bug
+# - Receipts + daily save
 
 import os
 import json
@@ -29,41 +29,50 @@ DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
 
-# ================== STYLE (REPORT LOOK) ==================
+# ================== STYLE (REPORT LOOK + REAL BORDERS) ==================
 st.markdown(
     """
 <style>
 /* Density */
 .main .block-container { padding-top: 0.55rem !important; padding-bottom: 0.8rem !important; max-width: 1600px !important; }
 h1,h2,h3 { margin-bottom: 0.2rem !important; }
-div[data-testid="stElementContainer"] { margin-bottom: 0.18rem !important; }
-div[data-testid="stHorizontalBlock"] { gap: 0.0rem !important; }
-div[data-testid="stVerticalBlock"] { gap: 0.15rem !important; }
+div[data-testid="stElementContainer"] { margin-bottom: 0.14rem !important; }
+div[data-testid="stVerticalBlock"] { gap: 0.12rem !important; }
 
-/* Report grid cells */
-.rep-head {
+/* --- Cell boxing done the RIGHT way ---
+   We drop a tiny sentinel span inside each "cell".
+   Then we style the Streamlit column vertical block that "has" that sentinel.
+   That way the border wraps BOTH markdown + widgets, without broken lines.
+*/
+div[data-testid="stVerticalBlock"]:has(span.rep-cell-sentinel) {
+  border: 1px solid #2a2a2a !important;
+  padding: 6px 8px !important;
+  background: #fff;
+  overflow: hidden;
+}
+div[data-testid="stVerticalBlock"]:has(span.rep-head-sentinel) {
+  background: #f3f3f3 !important;
   font-weight: 900;
-  font-size: 13px;
   text-align: center;
-  padding: 6px 6px;
-  border: 1px solid #2a2a2a;
-  background: #f3f3f3;
 }
-.rep-denom, .rep-cell, .rep-total {
-  border: 1px solid #2a2a2a;
-  padding: 6px 8px;
-  font-size: 13px;
-}
-.rep-denom { font-weight: 800; }
-.rep-cell { text-align: center; font-weight: 800; }
-.rep-total { font-weight: 950; }
-.rep-row { margin: 0 !important; }
 
-/* Make number_inputs look like plain report cells */
+/* Head text */
+.rep-head-text { font-size: 13px; font-weight: 900; text-align:center; }
+
+/* Denom + numbers */
+.rep-denom { font-size: 13px; font-weight: 850; }
+.rep-num { font-size: 13px; font-weight: 900; text-align:center; }
+
+/* RETRAIT cell tint */
+div[data-testid="stVerticalBlock"].rep-retrait-cell {
+  background: rgba(30,136,229,0.08) !important;
+}
+
+/* Number inputs: make them look like plain typed cells */
 div[data-testid="stNumberInput"] { margin-bottom: 0 !important; }
 div[data-testid="stNumberInput"] label { display:none !important; }
 div[data-testid="stNumberInput"] input{
-  height: 1.6rem !important;
+  height: 1.55rem !important;
   padding: 0 !important;
   border: 0 !important;
   background: transparent !important;
@@ -71,26 +80,24 @@ div[data-testid="stNumberInput"] input{
   font-weight: 900 !important;
   text-align: center !important;
 }
+div[data-testid="stNumberInput"] button { display:none !important; } /* hide default +/- */
 
-/* Hide the +/- steppers for report style */
-div[data-testid="stNumberInput"] button { display:none !important; }
-
-/* Slight focus ring so you can see where you are typing */
+/* Focus ring */
 div[data-testid="stNumberInput"] input:focus{
   outline: none !important;
   box-shadow: inset 0 0 0 2px rgba(30,136,229,0.35) !important;
   border-radius: 6px !important;
 }
 
-/* RETRAIT cells slightly tinted (blue-ish) */
-.retrait-cell {
-  background: rgba(30,136,229,0.08);
+/* Small +/- buttons for RETRAIT */
+button[kind="secondary"].rep-mini-btn {
+  padding: 0.15rem 0.35rem !important;
+  border-radius: 6px !important;
+  font-weight: 950 !important;
+  min-height: 1.55rem !important;
+  line-height: 1.0 !important;
 }
-
-/* Totals bar aligned */
-.totals-wrap { margin-top: 0.25rem; }
-.totals-label { font-weight: 900; font-size: 12px; opacity: .75; margin-bottom: 0.1rem; }
-.totals-val { font-weight: 950; font-size: 14px; text-align:center; padding: 8px 10px; border-radius: 12px; background: rgba(0,0,0,0.05); }
+div[data-testid="stButton"] { margin: 0 !important; }
 
 /* Tight divider */
 .hr-tight { margin: 0.35rem 0 0.55rem 0; border: 0; border-top: 1px solid rgba(0,0,0,0.15); }
@@ -282,31 +289,14 @@ def seed_int(key: str, default: int):
     if key not in st.session_state:
         st.session_state[key] = int(default)
 
-# ================== REPORT GRID RENDER ==================
-# widths close to screenshot feel
-COLS = [3.3, 1.15, 1.25, 2.7, 1.4]  # denom, col1, col2, retrait, restant
-
-def rep_header(h0, h1, h2, h3, h4):
-    c = st.columns(COLS)
-    c[0].markdown(f"<div class='rep-head'>{h0}</div>", unsafe_allow_html=True)
-    c[1].markdown(f"<div class='rep-head'>{h1}</div>", unsafe_allow_html=True)
-    c[2].markdown(f"<div class='rep-head'>{h2}</div>", unsafe_allow_html=True)
-    c[3].markdown(f"<div class='rep-head'>{h3}</div>", unsafe_allow_html=True)
-    c[4].markdown(f"<div class='rep-head'>{h4}</div>", unsafe_allow_html=True)
-
-def rep_cell_text(container, txt, extra_class=""):
-    container.markdown(f"<div class='rep-cell {extra_class}'>{txt}</div>", unsafe_allow_html=True)
-
-def rep_denom(container, txt):
-    container.markdown(f"<div class='rep-denom'>{txt}</div>", unsafe_allow_html=True)
-
-def rep_total_row(label, v1, v2, v3, v4):
-    c = st.columns(COLS)
-    c[0].markdown(f"<div class='rep-total'>{label}</div>", unsafe_allow_html=True)
-    c[1].markdown(f"<div class='rep-total' style='text-align:center'>{v1}</div>", unsafe_allow_html=True)
-    c[2].markdown(f"<div class='rep-total' style='text-align:center'>{v2}</div>", unsafe_allow_html=True)
-    c[3].markdown(f"<div class='rep-total' style='text-align:center'>{v3}</div>", unsafe_allow_html=True)
-    c[4].markdown(f"<div class='rep-total' style='text-align:center'>{v4}</div>", unsafe_allow_html=True)
+def bump_int(key: str, delta: int, mn: int, mx: int, lock_name=None, denom=None):
+    v = int(st.session_state.get(key, 0))
+    v = max(mn, min(mx, v + delta))
+    st.session_state[key] = v
+    if lock_name and denom is not None:
+        locked = dict(st.session_state.get(lock_name, {}) or {})
+        locked[denom] = v
+        st.session_state[lock_name] = locked
 
 def lock_from_widget(lock_name: str, denom: str, widget_key: str, mx: int):
     locked = dict(st.session_state.get(lock_name, {}) or {})
@@ -314,6 +304,17 @@ def lock_from_widget(lock_name: str, denom: str, widget_key: str, mx: int):
     v = max(0, min(int(mx), v))
     locked[denom] = v
     st.session_state[lock_name] = locked
+
+# ================== REPORT GRID RENDER ==================
+COLS = [3.25, 1.15, 1.25, 2.7, 1.35]  # denom, col1, col2, retrait, restant
+
+def rep_head_cell(col, text):
+    col.markdown("<span class='rep-head-sentinel rep-cell-sentinel'></span>", unsafe_allow_html=True)
+    col.markdown(f"<div class='rep-head-text'>{text}</div>", unsafe_allow_html=True)
+
+def rep_cell_sentinel(col, extra_class=""):
+    # sentinel to let CSS wrap border around this column's block
+    col.markdown(f"<span class='rep-cell-sentinel {extra_class}'></span>", unsafe_allow_html=True)
 
 def report_grid(
     keys_order: list,
@@ -332,53 +333,85 @@ def report_grid(
     ensure_counts(col1_prefix, keys_order)
     ensure_counts(col2_prefix, keys_order)
 
-    rep_header("Dénomination", headers[0], headers[1], headers[2], headers[3])
+    # Header row
+    head = st.columns(COLS, vertical_alignment="center")
+    rep_head_cell(head[0], "Dénomination")
+    rep_head_cell(head[1], headers[0])
+    rep_head_cell(head[2], headers[1])
+    rep_head_cell(head[3], headers[2])
+    rep_head_cell(head[4], headers[3])
 
     locked = dict(st.session_state.get(lock_name, {}) or {})
 
     for k in keys_order:
         row = st.columns(COLS, vertical_alignment="center")
 
-        rep_denom(row[0], k)
+        # denom
+        rep_cell_sentinel(row[0])
+        row[0].markdown(f"<div class='rep-denom'>{k}</div>", unsafe_allow_html=True)
 
-        # COL1
+        # col1
+        rep_cell_sentinel(row[1])
         v1 = int(st.session_state[col1_prefix].get(k, 0))
         w1 = f"{widget_prefix}__c1__{k}"
         seed_int(w1, v1)
         if allow_edit_col1:
-            # bordered cell + input inside
-            row[1].markdown("<div class='rep-cell'>", unsafe_allow_html=True)
             val = row[1].number_input("", min_value=0, step=1, key=w1)
-            row[1].markdown("</div>", unsafe_allow_html=True)
             set_count(col1_prefix, k, val)
         else:
-            rep_cell_text(row[1], v1)
+            row[1].markdown(f"<div class='rep-num'>{v1}</div>", unsafe_allow_html=True)
 
-        # COL2
+        # col2
+        rep_cell_sentinel(row[2])
         v2 = int(st.session_state[col2_prefix].get(k, 0))
         w2 = f"{widget_prefix}__c2__{k}"
         seed_int(w2, v2)
         if allow_edit_col2:
-            row[2].markdown("<div class='rep-cell'>", unsafe_allow_html=True)
             val = row[2].number_input("", min_value=0, step=1, key=w2)
-            row[2].markdown("</div>", unsafe_allow_html=True)
             set_count(col2_prefix, k, val)
         else:
-            rep_cell_text(row[2], v2)
+            row[2].markdown(f"<div class='rep-num'>{v2}</div>", unsafe_allow_html=True)
 
-        # RETRAIT editable
+        # retrait with +/- (one level nested columns ONLY)
+        rep_cell_sentinel(row[3])
+        # mark this cell as retrait for background tint
+        # we can't set class directly, so we add a tiny marker and use :has in CSS
+        row[3].markdown("<span class='rep-retrait-marker'></span>", unsafe_allow_html=True)
+
         q_suggest = int(retrait_suggested.get(k, 0))
         mx = int(avail_for_retrait.get(k, 0))
         w3 = f"{widget_prefix}__ret__{k}"
 
-        # Sync suggestion only until user touches (locks)
+        # Sync suggestion until user edits (locks)
         if k not in locked:
             st.session_state[w3] = q_suggest
         seed_int(w3, q_suggest)
 
+        # add background tint by tagging the vertical block via JS-less trick:
+        # we style any stVerticalBlock that has the marker.
+        st.markdown(
+            """
+<style>
+div[data-testid="stVerticalBlock"]:has(span.rep-retrait-marker){
+  background: rgba(30,136,229,0.08) !important;
+}
+</style>
+""",
+            unsafe_allow_html=True,
+        )
+
         if allow_edit_retrait:
-            row[3].markdown("<div class='rep-cell retrait-cell'>", unsafe_allow_html=True)
-            row[3].number_input(
+            c_minus, c_val, c_plus = row[3].columns([0.18, 0.64, 0.18], vertical_alignment="center")
+            c_minus.button(
+                "−",
+                key=f"{w3}_minus",
+                on_click=bump_int,
+                kwargs={"key": w3, "delta": -1, "mn": 0, "mx": mx, "lock_name": lock_name, "denom": k},
+                type="secondary",
+                use_container_width=True,
+            )
+            # apply class to button via CSS (Streamlit doesn't let us, so we style all secondary buttons in this layout)
+            c_val.number_input(
                 "",
                 min_value=0,
                 max_value=mx,
@@ -387,12 +420,30 @@ def report_grid(
                 on_change=lock_from_widget,
                 kwargs={"lock_name": lock_name, "denom": k, "widget_key": w3, "mx": mx},
             )
-            row[3].markdown("</div>", unsafe_allow_html=True)
+            c_plus.button(
+                "+",
+                key=f"{w3}_plus",
+                on_click=bump_int,
+                kwargs={"key": w3, "delta": 1, "mn": 0, "mx": mx, "lock_name": lock_name, "denom": k},
+                type="secondary",
+                use_container_width=True,
+            )
         else:
-            rep_cell_text(row[3], q_suggest, extra_class="retrait-cell")
+            row[3].markdown(f"<div class='rep-num'>{q_suggest}</div>", unsafe_allow_html=True)
 
-        # RESTANT
-        rep_cell_text(row[4], int(restant_counts.get(k, 0)))
+        # restant
+        rep_cell_sentinel(row[4])
+        row[4].markdown(f"<div class='rep-num'>{int(restant_counts.get(k, 0))}</div>", unsafe_allow_html=True)
+
+def report_total_row(label: str, v1: str, v2: str, v3: str, v4: str):
+    row = st.columns(COLS, vertical_alignment="center")
+
+    rep_cell_sentinel(row[0])
+    row[0].markdown(f"<div class='rep-denom' style='font-weight:950'>{label}</div>", unsafe_allow_html=True)
+
+    for col, val in zip(row[1:], [v1, v2, v3, v4]):
+        rep_cell_sentinel(col)
+        col.markdown(f"<div class='rep-num' style='font-weight:950'>{val}</div>", unsafe_allow_html=True)
 
 
 # ================== AUTH ==================
@@ -455,8 +506,9 @@ if st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
     # Caisse saved
-    sp, _ = caisse_paths(today)
-    saved = load_json(sp)
+    state_path_c, _ = (os.path.join(DIR_CAISSE, f"{today.isoformat()}_state.json"),
+                       os.path.join(DIR_CAISSE, f"{today.isoformat()}_receipt.html"))
+    saved = load_json(state_path_c)
     if saved:
         meta = saved.get("meta", {})
         st.session_state.cashier = meta.get("Caissier(ère)", st.session_state.cashier)
@@ -473,8 +525,9 @@ if st.session_state.booted_for != today.isoformat():
         st.session_state.locked_retrait_hier = saved.get("locked_retrait_hier", {}) or {}
 
     # Boîte saved
-    spb, _ = boite_paths(today)
-    savedb = load_json(spb)
+    state_path_b, _ = (os.path.join(DIR_BOITE, f"{today.isoformat()}_state.json"),
+                       os.path.join(DIR_BOITE, f"{today.isoformat()}_receipt.html"))
+    savedb = load_json(state_path_b)
     if savedb:
         st.session_state.boite_allowed = set(savedb.get("boite_allowed", list(st.session_state.boite_allowed)))
         counts = savedb.get("counts", {})
@@ -537,6 +590,7 @@ with tab_caisse:
 
         retrait_y = {k: 0 for k in DISPLAY_ORDER}
         restant_y = dict(close_y)
+
         if diff_y > 0:
             st.session_state.locked_retrait_hier = clamp_locked(st.session_state.locked_retrait_hier, close_y)
             retrait_y_full, _ = suggest(
@@ -564,7 +618,7 @@ with tab_caisse:
             headers=("OPEN", "CLOSE", "RETRAIT", "RESTANT"),
         )
 
-        rep_total_row(
+        report_total_row(
             "TOTAL ($)",
             f"{0/100:.2f}",
             f"{total_close_y/100:.2f}",
@@ -623,7 +677,7 @@ with tab_caisse:
         headers=("OPEN", "CLOSE", "RETRAIT", "RESTANT"),
     )
 
-    rep_total_row(
+    report_total_row(
         "TOTAL ($)",
         f"{total_open_today/100:.2f}",
         f"{total_close_today/100:.2f}",
@@ -771,7 +825,7 @@ with tab_boite:
         headers=("OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"),
     )
 
-    rep_total_row(
+    report_total_row(
         "TOTAL ($)",
         f"{total_open/100:.2f}",
         f"{total_added/100:.2f}",
