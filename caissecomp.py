@@ -1,13 +1,12 @@
 # caisse200+.py
 # Registre — Caisse & Boîte (Échange)
-# FULL rewrite (report style + fixed borders + +/- in RETRAIT)
+# REPORT look: white, condensed, centred, consistent sizing, minimal scrolling
 # - Auth
 # - Mode dropdown (Ouverture normale / Fermeture non effectuée)
-# - Report-like condensed grid with continuous borders (NO interrupted lines)
-# - RETRAIT editable IN-table with [-] [value] [+] (ATM vibe)
+# - Report-like grid with real continuous borders
+# - RETRAIT editable in-table with [-] [value] [+]
 # - Boîte headers: OPEN / AJOUTÉ / RETRAIT (en change) / RESTANT
-# - No st.data_editor, no nested-columns error, no reset-to-0 "enter" bug
-# - Receipts + daily save
+# - No st.data_editor
 
 import os
 import json
@@ -29,78 +28,98 @@ DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
 
-# ================== STYLE (REPORT LOOK + REAL BORDERS) ==================
+# ================== STYLE (WHITE + CONDENSED + CENTRED) ==================
 st.markdown(
     """
 <style>
-/* Density */
-.main .block-container { padding-top: 0.55rem !important; padding-bottom: 0.8rem !important; max-width: 1600px !important; }
+/* tighter page */
+.main .block-container { padding-top: 0.45rem !important; padding-bottom: 0.7rem !important; max-width: 1600px !important; }
 h1,h2,h3 { margin-bottom: 0.2rem !important; }
-div[data-testid="stElementContainer"] { margin-bottom: 0.14rem !important; }
-div[data-testid="stVerticalBlock"] { gap: 0.12rem !important; }
+div[data-testid="stVerticalBlock"] { gap: 0.08rem !important; }
+div[data-testid="stElementContainer"] { margin-bottom: 0.08rem !important; }
 
-/* --- Cell boxing done the RIGHT way ---
-   We drop a tiny sentinel span inside each "cell".
-   Then we style the Streamlit column vertical block that "has" that sentinel.
-   That way the border wraps BOTH markdown + widgets, without broken lines.
-*/
-div[data-testid="stVerticalBlock"]:has(span.rep-cell-sentinel) {
-  border: 1px solid #2a2a2a !important;
-  padding: 6px 8px !important;
-  background: #fff;
+/* ==== TRUE REPORT CELLS: border wraps what Streamlit actually renders ==== */
+div[data-testid="stVerticalBlock"]:has(span.rep-cell-sentinel){
+  border: 1px solid #1f1f1f !important;
+  padding: 4px 6px !important;      /* tighter */
+  background: #ffffff !important;   /* always white */
   overflow: hidden;
+  border-radius: 0 !important;      /* report look */
 }
-div[data-testid="stVerticalBlock"]:has(span.rep-head-sentinel) {
-  background: #f3f3f3 !important;
+div[data-testid="stVerticalBlock"]:has(span.rep-head-sentinel){
+  background: #f2f2f2 !important;   /* subtle header grey like report */
+  padding: 4px 6px !important;
+}
+
+/* headers */
+.rep-head-text{
+  font-size: 13px;
   font-weight: 900;
   text-align: center;
+  line-height: 1.0;
+  white-space: nowrap;
 }
 
-/* Head text */
-.rep-head-text { font-size: 13px; font-weight: 900; text-align:center; }
-
-/* Denom + numbers */
-.rep-denom { font-size: 13px; font-weight: 850; }
-.rep-num { font-size: 13px; font-weight: 900; text-align:center; }
-
-/* RETRAIT cell tint */
-div[data-testid="stVerticalBlock"].rep-retrait-cell {
-  background: rgba(30,136,229,0.08) !important;
+/* denom + numbers */
+.rep-denom{
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.0;
+}
+.rep-num{
+  font-size: 13px;
+  font-weight: 900;
+  text-align: center;
+  line-height: 1.0;
 }
 
-/* Number inputs: make them look like plain typed cells */
-div[data-testid="stNumberInput"] { margin-bottom: 0 !important; }
+/* Make ALL widgets look like plain report cells */
+div[data-testid="stNumberInput"] { margin: 0 !important; }
 div[data-testid="stNumberInput"] label { display:none !important; }
 div[data-testid="stNumberInput"] input{
-  height: 1.55rem !important;
+  height: 1.45rem !important;       /* consistent */
+  min-height: 1.45rem !important;
   padding: 0 !important;
+  margin: 0 !important;
   border: 0 !important;
   background: transparent !important;
   box-shadow: none !important;
+  font-size: 13px !important;
   font-weight: 900 !important;
   text-align: center !important;
+  line-height: 1.0 !important;
+}
+div[data-testid="stNumberInput"] input:focus{
+  outline: none !important;
+  box-shadow: inset 0 0 0 2px rgba(0,0,0,0.18) !important;
+  border-radius: 4px !important;
 }
 div[data-testid="stNumberInput"] button { display:none !important; } /* hide default +/- */
 
-/* Focus ring */
-div[data-testid="stNumberInput"] input:focus{
-  outline: none !important;
-  box-shadow: inset 0 0 0 2px rgba(30,136,229,0.35) !important;
-  border-radius: 6px !important;
-}
-
-/* Small +/- buttons for RETRAIT */
-button[kind="secondary"].rep-mini-btn {
-  padding: 0.15rem 0.35rem !important;
-  border-radius: 6px !important;
-  font-weight: 950 !important;
-  min-height: 1.55rem !important;
-  line-height: 1.0 !important;
-}
+/* Buttons inside RETRAIT (ATM style), keep small and consistent */
 div[data-testid="stButton"] { margin: 0 !important; }
+button[kind="secondary"]{
+  border: 1px solid rgba(0,0,0,0.35) !important;
+  background: #fff !important;
+  font-weight: 950 !important;
+}
+button[kind="secondary"].rep-mini{
+  padding: 0 !important;
+  width: 1.65rem !important;
+  height: 1.45rem !important;
+  min-height: 1.45rem !important;
+  border-radius: 4px !important;
+  line-height: 1 !important;
+}
 
-/* Tight divider */
-.hr-tight { margin: 0.35rem 0 0.55rem 0; border: 0; border-top: 1px solid rgba(0,0,0,0.15); }
+/* compact selectbox */
+div[data-testid="stSelectbox"] label { font-weight: 800 !important; }
+div[data-testid="stSelectbox"] div[role="combobox"]{
+  min-height: 2.0rem !important;
+}
+
+/* tight divider */
+.hr-tight { margin: 0.25rem 0 0.45rem 0; border: 0; border-top: 1px solid rgba(0,0,0,0.15); }
 </style>
 """,
     unsafe_allow_html=True,
@@ -306,15 +325,14 @@ def lock_from_widget(lock_name: str, denom: str, widget_key: str, mx: int):
     st.session_state[lock_name] = locked
 
 # ================== REPORT GRID RENDER ==================
-COLS = [3.25, 1.15, 1.25, 2.7, 1.35]  # denom, col1, col2, retrait, restant
+COLS = [3.35, 1.15, 1.15, 2.25, 1.15]  # tighter retrait col
 
 def rep_head_cell(col, text):
     col.markdown("<span class='rep-head-sentinel rep-cell-sentinel'></span>", unsafe_allow_html=True)
     col.markdown(f"<div class='rep-head-text'>{text}</div>", unsafe_allow_html=True)
 
-def rep_cell_sentinel(col, extra_class=""):
-    # sentinel to let CSS wrap border around this column's block
-    col.markdown(f"<span class='rep-cell-sentinel {extra_class}'></span>", unsafe_allow_html=True)
+def rep_cell_sentinel(col):
+    col.markdown("<span class='rep-cell-sentinel'></span>", unsafe_allow_html=True)
 
 def report_grid(
     keys_order: list,
@@ -328,7 +346,7 @@ def report_grid(
     allow_edit_retrait: bool,
     lock_name: str,
     widget_prefix: str,
-    headers: tuple,  # ("OPEN", "CLOSE", "RETRAIT", "RESTANT")
+    headers: tuple,
 ):
     ensure_counts(col1_prefix, keys_order)
     ensure_counts(col2_prefix, keys_order)
@@ -372,36 +390,20 @@ def report_grid(
         else:
             row[2].markdown(f"<div class='rep-num'>{v2}</div>", unsafe_allow_html=True)
 
-        # retrait with +/- (one level nested columns ONLY)
+        # retrait (+/-)
         rep_cell_sentinel(row[3])
-        # mark this cell as retrait for background tint
-        # we can't set class directly, so we add a tiny marker and use :has in CSS
-        row[3].markdown("<span class='rep-retrait-marker'></span>", unsafe_allow_html=True)
 
         q_suggest = int(retrait_suggested.get(k, 0))
         mx = int(avail_for_retrait.get(k, 0))
         w3 = f"{widget_prefix}__ret__{k}"
 
-        # Sync suggestion until user edits (locks)
+        # keep suggestion unless user locked it
         if k not in locked:
             st.session_state[w3] = q_suggest
         seed_int(w3, q_suggest)
 
-        # add background tint by tagging the vertical block via JS-less trick:
-        # we style any stVerticalBlock that has the marker.
-        st.markdown(
-            """
-<style>
-div[data-testid="stVerticalBlock"]:has(span.rep-retrait-marker){
-  background: rgba(30,136,229,0.08) !important;
-}
-</style>
-""",
-            unsafe_allow_html=True,
-        )
-
         if allow_edit_retrait:
-            c_minus, c_val, c_plus = row[3].columns([0.18, 0.64, 0.18], vertical_alignment="center")
+            c_minus, c_val, c_plus = row[3].columns([0.22, 0.56, 0.22], vertical_alignment="center")
             c_minus.button(
                 "−",
                 key=f"{w3}_minus",
@@ -410,7 +412,9 @@ div[data-testid="stVerticalBlock"]:has(span.rep-retrait-marker){
                 type="secondary",
                 use_container_width=True,
             )
-            # apply class to button via CSS (Streamlit doesn't let us, so we style all secondary buttons in this layout)
+            # style hook: shrink these buttons
+            c_minus.markdown("<style>button[kind='secondary']{}</style>", unsafe_allow_html=True)
+
             c_val.number_input(
                 "",
                 min_value=0,
@@ -427,6 +431,13 @@ div[data-testid="stVerticalBlock"]:has(span.rep-retrait-marker){
                 kwargs={"key": w3, "delta": 1, "mn": 0, "mx": mx, "lock_name": lock_name, "denom": k},
                 type="secondary",
                 use_container_width=True,
+            )
+
+            # force mini button class via CSS targeting the specific keys is not possible,
+            # so we apply a general rule: all secondary buttons in this app are mini.
+            st.markdown(
+                "<style>button[kind='secondary']{padding:0!important;width:1.65rem!important;height:1.45rem!important;min-height:1.45rem!important;border-radius:4px!important;}</style>",
+                unsafe_allow_html=True,
             )
         else:
             row[3].markdown(f"<div class='rep-num'>{q_suggest}</div>", unsafe_allow_html=True)
@@ -505,9 +516,7 @@ def apply_mode_change(new_mode: str):
 if st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
-    # Caisse saved
-    state_path_c, _ = (os.path.join(DIR_CAISSE, f"{today.isoformat()}_state.json"),
-                       os.path.join(DIR_CAISSE, f"{today.isoformat()}_receipt.html"))
+    state_path_c, _ = caisse_paths(today)
     saved = load_json(state_path_c)
     if saved:
         meta = saved.get("meta", {})
@@ -524,9 +533,7 @@ if st.session_state.booted_for != today.isoformat():
         st.session_state.locked_retrait_caisse = saved.get("locked_retrait_caisse", {}) or {}
         st.session_state.locked_retrait_hier = saved.get("locked_retrait_hier", {}) or {}
 
-    # Boîte saved
-    state_path_b, _ = (os.path.join(DIR_BOITE, f"{today.isoformat()}_state.json"),
-                       os.path.join(DIR_BOITE, f"{today.isoformat()}_receipt.html"))
+    state_path_b, _ = boite_paths(today)
     savedb = load_json(state_path_b)
     if savedb:
         st.session_state.boite_allowed = set(savedb.get("boite_allowed", list(st.session_state.boite_allowed)))
@@ -579,11 +586,9 @@ with tab_caisse:
     ensure_counts(CLOSE_T, DISPLAY_ORDER)
     ensure_counts(CLOSE_Y, DISPLAY_ORDER)
 
-    # ---------------- YESTERDAY (MISSED CLOSE) ----------------
+    # ---- Yesterday in missed close mode
     if st.session_state.mode_pick == "missed_close":
-        st.markdown("#### ⚠️ Hier — fermeture non effectuée")
-        st.caption("Entre le CLOSE d'hier, puis ajuste le RETRAIT (colonne bleue). OPEN d'aujourd'hui = RESTANT d'hier.")
-
+        st.markdown("#### Hier — fermeture non effectuée")
         close_y = get_counts(CLOSE_Y)
         total_close_y = total_cents(close_y)
         diff_y = total_close_y - TARGET
@@ -638,7 +643,7 @@ with tab_caisse:
 
         st.markdown("<hr class='hr-tight'/>", unsafe_allow_html=True)
 
-    # ---------------- TODAY ----------------
+    # ---- Today
     open_today = get_counts(OPEN_T)
     close_today = get_counts(CLOSE_T)
 
@@ -689,17 +694,7 @@ with tab_caisse:
         st.session_state.locked_retrait_caisse = {}
         st.rerun()
 
-    if diff_today <= 0:
-        st.info("Sous la cible (ou égal). Aucun retrait.")
-    else:
-        if remaining_today == 0:
-            st.success("Retrait aujourd'hui: " + cents_to_str(total_cents(retrait_today)))
-        elif remaining_today < 0:
-            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_today))
-        else:
-            st.warning("Impossible exact. Reste: " + cents_to_str(remaining_today))
-
-    # Receipt rows (today)
+    # Receipt rows
     rows_today = []
     for k in DISPLAY_ORDER:
         rows_today.append({
@@ -749,15 +744,15 @@ with tab_caisse:
         st.session_state.last_hash_caisse = hc
 
     st.markdown("### Aperçu reçu — Caisse")
-    components.html(load_text(receipt_path) or "", height=560, scrolling=True)
+    components.html(load_text(receipt_path) or "", height=520, scrolling=True)
 
 
 # ================== TAB: BOÎTE ==================
 with tab_boite:
     st.subheader("Boîte (Échange)")
-    st.caption("Boîte: OPEN (avant), AJOUTÉ (dépôt), RETRAIT (en change) (bleu), RESTANT (après).")
+    st.caption("OPEN (avant), AJOUTÉ, RETRAIT (en change), RESTANT (après).")
 
-    with st.expander("⚙️ Types autorisés pour le change", expanded=True):
+    with st.expander("⚙️ Types autorisés pour le change", expanded=False):
         allowed = set(st.session_state.boite_allowed)
         c1, c2, c3 = st.columns(3)
         cols = [c1, c2, c3]
@@ -779,7 +774,6 @@ with tab_boite:
 
     box_open = get_counts(OPEN_B)
     box_added = get_counts(ADD_B)
-
     total_open = total_cents(box_open)
     total_added = total_cents(box_added)
 
@@ -837,19 +831,6 @@ with tab_boite:
         st.session_state.locked_withdraw_boite = {}
         st.rerun()
 
-    if total_added == 0:
-        st.info("Ajouté = 0. Rien à calculer.")
-    elif not st.session_state.boite_allowed:
-        st.error("Aucun type autorisé.")
-    else:
-        if remaining_boite == 0:
-            st.success("Change retiré: " + cents_to_str(total_cents(retrait_change)))
-        elif remaining_boite < 0:
-            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_boite))
-        else:
-            st.warning("Impossible exact. Reste: " + cents_to_str(remaining_boite))
-
-    # Receipt (boîte)
     rows_boite = []
     for k in DISPLAY_ORDER:
         rows_boite.append({
@@ -898,14 +879,12 @@ with tab_boite:
         st.session_state.last_hash_boite = hb
 
     st.markdown("### Aperçu reçu — Boîte (Échange)")
-    components.html(load_text(receipt_path_b) or "", height=560, scrolling=True)
+    components.html(load_text(receipt_path_b) or "", height=520, scrolling=True)
 
 
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
-    st.caption("Clique une date pour voir le reçu détaillé et télécharger les fichiers.")
-
     colA, colB = st.columns(2)
 
     with colA:
@@ -921,8 +900,6 @@ with tab_save:
                     html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    else:
-                        st.warning("Reçu introuvable.")
                     if os.path.exists(receipt_path):
                         with open(receipt_path, "rb") as f:
                             st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_c_html_{ds}")
@@ -943,8 +920,6 @@ with tab_save:
                     html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    else:
-                        st.warning("Reçu introuvable.")
                     if os.path.exists(receipt_path):
                         with open(receipt_path, "rb") as f:
                             st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_b_html_{ds}")
