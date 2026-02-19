@@ -1,12 +1,7 @@
-# caisse200+.py
+# caisse200plus.py
 # Registre — Caisse & Boîte (Échange)
-# Compact "report-style" tables using st.data_editor WITHOUT Enter-reset bugs
-# - Auth
-# - Mode dropdown
-# - Caisse: editable OPEN/CLOSE/RETRAIT, RESTANT computed
-# - Missed close: yesterday CLOSE/RETRAIT => RESTANT, and OPEN today locked = RESTANT yesterday
-# - Boîte: OPEN/AJOUTÉ/RETRAIT (en change), RESTANT computed
-# - Save: JSON + HTML receipts
+# Compact "report-style" tables using st.data_editor
+# Fixes: Enter/blur reverting values to 0 by preserving previous value when edited cell is None/blank.
 
 import os
 import json
@@ -44,7 +39,7 @@ div[data-testid="stDataFrame"] th { font-weight: 900 !important; }
 div[data-testid="stDataFrame"] td { font-weight: 700 !important; }
 div[data-testid="stDataFrame"] input { font-weight: 900 !important; text-align: center !important; }
 
-/* Tighter vertical spacing overall */
+/* tighter overall spacing */
 div[data-testid="stVerticalBlock"] { gap: 0.22rem !important; }
 </style>
 """,
@@ -91,30 +86,76 @@ def cents_to_str(c: int) -> str:
 def total_cents_counts(counts: dict) -> int:
     return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
 
-def safe_int_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0).astype(int).clip(lower=0)
-
-def sanitize_df(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    # Make sure missing columns are created (Streamlit can be "creative" on reruns)
-    out = df.copy()
-    for c in cols:
-        if c not in out.columns:
-            out[c] = 0
-        out[c] = safe_int_series(out[c])
-    return out
-
-def counts_from_df(df: pd.DataFrame, col: str) -> dict:
-    if col not in df.columns:
-        return {k: 0 for k in DISPLAY_ORDER}
-    # Ensure all denoms exist, keep order stable
-    m = {row["Dénomination"]: int(row[col]) for _, row in df.iterrows() if "Dénomination" in row}
-    return {k: int(m.get(k, 0)) for k in DISPLAY_ORDER}
-
 def init_df(columns: list[str]) -> pd.DataFrame:
     df = pd.DataFrame({"Dénomination": DISPLAY_ORDER})
     for c in columns:
         df[c] = 0
     return df
+
+def counts_from_df(df: pd.DataFrame, col: str) -> dict:
+    if col not in df.columns:
+        return {k: 0 for k in DISPLAY_ORDER}
+    m = {row["Dénomination"]: row[col] for _, row in df.iterrows()}
+    out = {}
+    for k in DISPLAY_ORDER:
+        try:
+            v = int(m.get(k, 0))
+        except Exception:
+            v = 0
+        if v < 0:
+            v = 0
+        out[k] = v
+    return out
+
+def coerce_int_or_none(x):
+    # Keep None/blank as None (do NOT convert to 0 mid-edit)
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    try:
+        v = int(x)
+    except Exception:
+        return None
+    return max(0, v)
+
+def merge_preserve(base: pd.DataFrame, edited: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """
+    Merge edited into base.
+    If edited cell is None/NaN/blank, keep base value.
+    Prevents "Enter -> 0" resets.
+    """
+    out = base.copy()
+    if not isinstance(edited, pd.DataFrame):
+        return out
+
+    if "Dénomination" not in edited.columns:
+        return out
+
+    out = out.set_index("Dénomination")
+    e = edited.copy().set_index("Dénomination")
+
+    for c in cols:
+        if c not in out.columns:
+            out[c] = 0
+        if c not in e.columns:
+            continue
+
+        new_vals = []
+        for denom in out.index:
+            cur = out.at[denom, c]
+            val = e.at[denom, c] if denom in e.index else None
+            val = coerce_int_or_none(val)
+            if val is None:
+                new_vals.append(int(cur))
+            else:
+                new_vals.append(int(val))
+        out[c] = new_vals
+
+    return out.reset_index()
 
 def hash_payload(obj: dict) -> str:
     raw = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -233,7 +274,7 @@ if "last_hash_caisse" not in st.session_state:
 if "last_hash_boite" not in st.session_state:
     st.session_state.last_hash_boite = None
 
-# persistent base dfs
+# base tables (persisted)
 if "base_caisse_today" not in st.session_state:
     st.session_state.base_caisse_today = init_df(["OPEN", "CLOSE", "RETRAIT"])
 if "base_caisse_yesterday" not in st.session_state:
@@ -241,7 +282,7 @@ if "base_caisse_yesterday" not in st.session_state:
 if "base_boite" not in st.session_state:
     st.session_state.base_boite = init_df(["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
 
-# load saved daily state
+# load saved daily state once per day
 if "booted_for" not in st.session_state or st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
@@ -309,7 +350,7 @@ st.session_state.target_dollars = st.number_input(
 tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", "3) Sauvegarde & reçus"])
 
 
-# ================== CAISSE TAB ==================
+# ================== TAB: CAISSE ==================
 with tab_caisse:
     mode_labels = {"normal": "Ouverture normale", "missed_close": "Fermeture non effectuée (hier)"}
     picked = st.selectbox(
@@ -324,29 +365,25 @@ with tab_caisse:
         st.rerun()
 
     TARGET = int(st.session_state.target_dollars) * 100
-
     restant_y = {k: 0 for k in DISPLAY_ORDER}
 
-    # ----- Yesterday (missed close only)
+    # ---- Hier (only if missed_close)
     if st.session_state.mode_pick == "missed_close":
         st.subheader("Hier — fermeture non effectuée")
 
-        dfy = st.session_state.base_caisse_yesterday.copy()
-        dfy = sanitize_df(dfy, ["CLOSE", "RETRAIT"])
-
-        close_y = counts_from_df(dfy, "CLOSE")
-        retrait_y = counts_from_df(dfy, "RETRAIT")
+        base_y = st.session_state.base_caisse_yesterday.copy()
+        close_y = counts_from_df(base_y, "CLOSE")
+        retrait_y = counts_from_df(base_y, "RETRAIT")
         for k in DISPLAY_ORDER:
             if retrait_y[k] > close_y[k]:
                 retrait_y[k] = close_y[k]
-
         restant_y = {k: max(0, close_y[k] - retrait_y[k]) for k in DISPLAY_ORDER}
 
-        dfy["RETRAIT"] = [retrait_y[k] for k in DISPLAY_ORDER]
-        dfy["RESTANT"] = [restant_y[k] for k in DISPLAY_ORDER]
+        dfy_view = base_y.copy()
+        dfy_view["RESTANT"] = [restant_y[k] for k in DISPLAY_ORDER]
 
         edited_y = st.data_editor(
-            dfy[["Dénomination", "CLOSE", "RETRAIT", "RESTANT"]],
+            dfy_view[["Dénomination", "CLOSE", "RETRAIT", "RESTANT"]],
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -360,12 +397,11 @@ with tab_caisse:
             key="editor_caisse_y",
         )
 
-        # persist from the RETURN VALUE (not from session_state)
-        edited_y = sanitize_df(edited_y, ["CLOSE", "RETRAIT"])
-        st.session_state.base_caisse_yesterday = edited_y[["Dénomination", "CLOSE", "RETRAIT"]]
+        merged_y = merge_preserve(st.session_state.base_caisse_yesterday, edited_y, ["CLOSE", "RETRAIT"])
+        st.session_state.base_caisse_yesterday = merged_y[["Dénomination", "CLOSE", "RETRAIT"]]
 
-        close_y = counts_from_df(edited_y, "CLOSE")
-        retrait_y = counts_from_df(edited_y, "RETRAIT")
+        close_y = counts_from_df(st.session_state.base_caisse_yesterday, "CLOSE")
+        retrait_y = counts_from_df(st.session_state.base_caisse_yesterday, "RETRAIT")
         for k in DISPLAY_ORDER:
             if retrait_y[k] > close_y[k]:
                 retrait_y[k] = close_y[k]
@@ -378,29 +414,30 @@ with tab_caisse:
         )
         st.divider()
 
-    # ----- Today
+    # ---- Aujourd'hui
     st.subheader("Aujourd'hui")
 
-    dft = st.session_state.base_caisse_today.copy()
-    dft = sanitize_df(dft, ["OPEN", "CLOSE", "RETRAIT"])
+    base_t = st.session_state.base_caisse_today.copy()
 
-    open_disabled = (st.session_state.mode_pick != "normal")
     if st.session_state.mode_pick == "missed_close":
-        dft["OPEN"] = [int(restant_y.get(k, 0)) for k in DISPLAY_ORDER]
+        base_t["OPEN"] = [int(restant_y.get(k, 0)) for k in DISPLAY_ORDER]
 
-    open_t = counts_from_df(dft, "OPEN")
-    close_t = counts_from_df(dft, "CLOSE")
-    retrait_t = counts_from_df(dft, "RETRAIT")
+    open_t = counts_from_df(base_t, "OPEN")
+    close_t = counts_from_df(base_t, "CLOSE")
+    retrait_t = counts_from_df(base_t, "RETRAIT")
     for k in DISPLAY_ORDER:
         if retrait_t[k] > close_t[k]:
             retrait_t[k] = close_t[k]
     restant_t = {k: max(0, close_t[k] - retrait_t[k]) for k in DISPLAY_ORDER}
 
-    dft["RETRAIT"] = [retrait_t[k] for k in DISPLAY_ORDER]
-    dft["RESTANT"] = [restant_t[k] for k in DISPLAY_ORDER]
+    view_t = base_t.copy()
+    view_t["RETRAIT"] = [retrait_t[k] for k in DISPLAY_ORDER]
+    view_t["RESTANT"] = [restant_t[k] for k in DISPLAY_ORDER]
+
+    open_disabled = (st.session_state.mode_pick != "normal")
 
     edited_t = st.data_editor(
-        dft[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]],
+        view_t[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]],
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
@@ -415,14 +452,15 @@ with tab_caisse:
         key="editor_caisse_t",
     )
 
-    # persist from RETURN VALUE
-    edited_t = sanitize_df(edited_t, ["OPEN", "CLOSE", "RETRAIT"])
-    st.session_state.base_caisse_today = edited_t[["Dénomination", "OPEN", "CLOSE", "RETRAIT"]]
+    merged_t = merge_preserve(st.session_state.base_caisse_today, edited_t, ["OPEN", "CLOSE", "RETRAIT"])
+    # if missed_close, OPEN is forced from yesterday restant
+    if st.session_state.mode_pick == "missed_close":
+        merged_t["OPEN"] = [int(restant_y.get(k, 0)) for k in DISPLAY_ORDER]
+    st.session_state.base_caisse_today = merged_t[["Dénomination", "OPEN", "CLOSE", "RETRAIT"]]
 
-    # recompute totals from persisted edited_t
-    open_t = counts_from_df(edited_t, "OPEN")
-    close_t = counts_from_df(edited_t, "CLOSE")
-    retrait_t = counts_from_df(edited_t, "RETRAIT")
+    open_t = counts_from_df(st.session_state.base_caisse_today, "OPEN")
+    close_t = counts_from_df(st.session_state.base_caisse_today, "CLOSE")
+    retrait_t = counts_from_df(st.session_state.base_caisse_today, "RETRAIT")
     for k in DISPLAY_ORDER:
         if retrait_t[k] > close_t[k]:
             retrait_t[k] = close_t[k]
@@ -483,7 +521,7 @@ with tab_caisse:
     state_path, receipt_path = caisse_paths(today)
     hc = hash_payload(payload)
     if st.session_state.last_hash_caisse != hc:
-        html = receipt_html("Reçu — Caisse", meta, ["Dénomination","OPEN","CLOSE","RETRAIT","RESTANT"], rows)
+        html = receipt_html("Reçu — Caisse", meta, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows)
         save_json(state_path, payload)
         save_text(receipt_path, html)
         st.session_state.last_hash_caisse = hc
@@ -492,16 +530,15 @@ with tab_caisse:
         components.html(load_text(receipt_path) or "", height=520, scrolling=True)
 
 
-# ================== BOÎTE TAB ==================
+# ================== TAB: BOÎTE ==================
 with tab_boite:
     st.subheader("Boîte (Échange)")
 
-    dfb = st.session_state.base_boite.copy()
-    dfb = sanitize_df(dfb, ["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
+    base_b = st.session_state.base_boite.copy()
 
-    open_b = counts_from_df(dfb, "OPEN")
-    add_b = counts_from_df(dfb, "AJOUTÉ")
-    ret_b = counts_from_df(dfb, "RETRAIT (en change)")
+    open_b = counts_from_df(base_b, "OPEN")
+    add_b = counts_from_df(base_b, "AJOUTÉ")
+    ret_b = counts_from_df(base_b, "RETRAIT (en change)")
 
     after_added = {k: open_b[k] + add_b[k] for k in DISPLAY_ORDER}
     for k in DISPLAY_ORDER:
@@ -509,11 +546,12 @@ with tab_boite:
             ret_b[k] = after_added[k]
     restant_b = {k: max(0, after_added[k] - ret_b[k]) for k in DISPLAY_ORDER}
 
-    dfb["RETRAIT (en change)"] = [ret_b[k] for k in DISPLAY_ORDER]
-    dfb["RESTANT"] = [restant_b[k] for k in DISPLAY_ORDER]
+    view_b = base_b.copy()
+    view_b["RETRAIT (en change)"] = [ret_b[k] for k in DISPLAY_ORDER]
+    view_b["RESTANT"] = [restant_b[k] for k in DISPLAY_ORDER]
 
     edited_b = st.data_editor(
-        dfb[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"]],
+        view_b[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"]],
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
@@ -528,12 +566,13 @@ with tab_boite:
         key="editor_boite",
     )
 
-    edited_b = sanitize_df(edited_b, ["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
-    st.session_state.base_boite = edited_b[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)"]]
+    merged_b = merge_preserve(st.session_state.base_boite, edited_b, ["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
+    st.session_state.base_boite = merged_b[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)"]]
 
-    open_b = counts_from_df(edited_b, "OPEN")
-    add_b = counts_from_df(edited_b, "AJOUTÉ")
-    ret_b = counts_from_df(edited_b, "RETRAIT (en change)")
+    open_b = counts_from_df(st.session_state.base_boite, "OPEN")
+    add_b = counts_from_df(st.session_state.base_boite, "AJOUTÉ")
+    ret_b = counts_from_df(st.session_state.base_boite, "RETRAIT (en change)")
+
     after_added = {k: open_b[k] + add_b[k] for k in DISPLAY_ORDER}
     for k in DISPLAY_ORDER:
         if ret_b[k] > after_added[k]:
@@ -602,9 +641,10 @@ with tab_boite:
         components.html(load_text(receipt_path) or "", height=520, scrolling=True)
 
 
-# ================== SAVE TAB ==================
+# ================== TAB: SAVE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
+
     colA, colB = st.columns(2)
 
     with colA:
