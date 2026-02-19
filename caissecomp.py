@@ -1,11 +1,11 @@
-# caisse_one_table.py
-# Registre — Caisse & Boîte (Échange)
-# SINGLE TABLE PER SECTION (inputs + computed + TOTAL in the same data_editor)
-# - No reverting to 0: we never rebuild editor df every rerun; only update in-place on Apply
-# - Mode dropdown: Ouverture normale / Fermeture non effectuée (hier)
-# - Lock/Unlock: LOCK + RETRAIT_LOCK per denom (force 0 to refuse denom)
-# - Boîte columns: OPEN / AJOUTÉ / RETRAIT (en change) / RESTANT
-# - Compact white report style
+# caisse_one_table_autosuggest.py
+# Registre — Caisse & Boîte
+# ONE table per tab (no extra result table)
+# - RETRAIT auto-suggested to bring CLOSE down to target
+# - You can override RETRAIT by editing cells in the SAME table
+# - Overrides act like "implicit locks" WITHOUT showing lock columns
+# - Button to reset overrides (the only sane way to "unlock" without extra UI)
+# - Fix "Enter resets to 0" by keeping DF + overrides in session_state and not rebuilding them each rerun
 
 import os
 import json
@@ -17,7 +17,6 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-
 # ================== CONFIG ==================
 st.set_page_config(page_title="Registre — Caisse & Boîte", layout="wide")
 TZ = ZoneInfo("America/Toronto")
@@ -28,8 +27,7 @@ DIR_BOITE = os.path.join(BASE_DIR, "records_boite")
 os.makedirs(DIR_CAISSE, exist_ok=True)
 os.makedirs(DIR_BOITE, exist_ok=True)
 
-
-# ================== STYLE (WHITE, COMPACT) ==================
+# ================== STYLE (white + compact) ==================
 st.markdown(
     """
 <style>
@@ -39,18 +37,9 @@ hr { margin: .55rem 0 !important; }
 .stCaption { opacity:.72; }
 button[kind="secondary"], button[kind="primary"] { font-weight: 800 !important; }
 
-div[data-testid="stDataFrameResizable"], div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] {
-  border-radius: 10px !important;
-}
-
-/* keep everything white, clean */
-div[data-testid="stDataEditor"] { background: #fff !important; }
-
-/* slightly tighter fonts */
+/* Compact editor, report-like */
+div[data-testid="stDataEditor"] { background:#fff !important; border-radius: 10px !important; }
 div[data-testid="stDataEditor"] * { font-size: 14px; }
-
-/* reduce empty vertical air a bit */
-div[data-testid="stDataEditor"] { padding-top: 0.1rem !important; padding-bottom: 0.1rem !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -85,12 +74,10 @@ ROLLS = [
     "Rouleau 0,10 $ (50) — 5 $",
     "Rouleau 0,05 $ (40) — 2 $",
 ]
-DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + COINS + ROLLS
+DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + sorted(COINS, key=lambda x: DENOMS[x], reverse=True) + sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
 TOTAL_ROW_LABEL = "TOTAL ($)"
 
-COINS_DESC = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
-ROLLS_DESC = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
-PRIORITY_CAISSE = BILLS_BIG + BILLS_SMALL + COINS_DESC + ROLLS_DESC
+PRIORITY_CAISSE = DISPLAY_ORDER[:]  # big -> small already
 PRIORITY_BOITE = (
     ["Billet 20 $", "Billet 10 $", "Billet 5 $"]
     + ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
@@ -101,7 +88,7 @@ PRIORITY_BOITE = (
 # ================== HELPERS ==================
 def safe_int(x) -> int:
     try:
-        if pd.isna(x):
+        if pd.isna(x) or x is None:
             return 0
         return int(x)
     except Exception:
@@ -110,27 +97,11 @@ def safe_int(x) -> int:
 def cents_to_str(c: int) -> str:
     return f"{c/100:.2f} $"
 
-def editor_height(rows: int) -> int:
-    # header ~ 38-44, row ~ 28-30; keep tight
-    return 44 + rows * 30 + 10
+def total_cents_from_counts(counts: dict) -> int:
+    return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DISPLAY_ORDER)
 
-def list_dates(folder: str):
-    files = sorted([f for f in os.listdir(folder) if f.endswith("_state.json")])
-    return [f.replace("_state.json", "") for f in files]
-
-def caisse_paths(d: date):
-    ds = d.isoformat()
-    return (
-        os.path.join(DIR_CAISSE, f"{ds}_state.json"),
-        os.path.join(DIR_CAISSE, f"{ds}_receipt.html"),
-    )
-
-def boite_paths(d: date):
-    ds = d.isoformat()
-    return (
-        os.path.join(DIR_BOITE, f"{ds}_state.json"),
-        os.path.join(DIR_BOITE, f"{ds}_receipt.html"),
-    )
+def editor_height(n_rows: int) -> int:
+    return 46 + n_rows * 30 + 8
 
 def save_json(path: str, payload: dict):
     with open(path, "w", encoding="utf-8") as f:
@@ -169,7 +140,6 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
             else:
                 tds.append(f"<td style='text-align:center'><b>{val}</b></td>")
         body += "<tr>" + "".join(tds) + "</tr>"
-
     return f"""
     <html><head><meta charset="utf-8"/><title>{title}</title>
     <style>
@@ -196,12 +166,49 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     </body></html>
     """
 
-def total_cents_from_counts(counts: dict) -> int:
-    return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DISPLAY_ORDER)
+def caisse_paths(d: date):
+    ds = d.isoformat()
+    return (
+        os.path.join(DIR_CAISSE, f"{ds}_state.json"),
+        os.path.join(DIR_CAISSE, f"{ds}_receipt.html"),
+    )
 
-def clamp_locked_counts(locked: dict, avail: dict) -> dict:
+def boite_paths(d: date):
+    ds = d.isoformat()
+    return (
+        os.path.join(DIR_BOITE, f"{ds}_state.json"),
+        os.path.join(DIR_BOITE, f"{ds}_receipt.html"),
+    )
+
+def ensure_df_caisse_today():
+    return pd.DataFrame({
+        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
+        "OPEN": [0]*len(DISPLAY_ORDER) + [0.0],
+        "CLOSE": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # editable override
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],   # computed
+    })
+
+def ensure_df_caisse_yesterday():
+    return pd.DataFrame({
+        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
+        "CLOSE": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # editable override
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],   # computed
+    })
+
+def ensure_df_boite():
+    return pd.DataFrame({
+        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
+        "OPEN": [0]*len(DISPLAY_ORDER) + [0.0],
+        "AJOUTÉ": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RETRAIT (en change)": [0]*len(DISPLAY_ORDER) + [0.0],  # editable override
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],              # computed
+    })
+
+def clamp_override(override: dict, avail: dict) -> dict:
     out = {}
-    for k, v in (locked or {}).items():
+    for k, v in (override or {}).items():
         v = int(v)
         if v < 0:
             v = 0
@@ -211,195 +218,134 @@ def clamp_locked_counts(locked: dict, avail: dict) -> dict:
         out[k] = v
     return out
 
-def take_greedy(remaining: int, keys_order: list, avail: dict, out: dict, locked: dict) -> int:
-    for k in keys_order:
-        if remaining <= 0:
+def greedy_fill(remaining_cents: int, avail_counts: dict, fixed_counts: dict, priority: list) -> dict:
+    # Start with fixed counts
+    out = {k: int(fixed_counts.get(k, 0)) for k in DISPLAY_ORDER}
+    fixed_keys = set(k for k, v in fixed_counts.items() if v is not None)
+
+    rem = remaining_cents - total_cents_from_counts(out)
+    if rem <= 0:
+        return out  # already met or over
+
+    for k in priority:
+        if rem <= 0:
             break
-        if k in locked:
+        if k in fixed_keys:
             continue
         v = DENOMS[k]
-        can_take = int(avail.get(k, 0)) - int(out.get(k, 0))
-        if can_take < 0:
-            can_take = 0
-        take = min(remaining // v, can_take)
+        can_take = int(avail_counts.get(k, 0)) - int(out.get(k, 0))
+        if can_take <= 0:
+            continue
+        take = min(rem // v, can_take)
         if take > 0:
             out[k] = int(out.get(k, 0)) + int(take)
-            remaining -= int(take) * v
-    return remaining
+            rem -= int(take) * v
 
-def suggest_retrait(amount_cents: int, avail: dict, locked: dict, priority: list):
-    out = {k: 0 for k in DISPLAY_ORDER}
-    for k, q in (locked or {}).items():
-        out[k] = int(q)
+    return out
 
-    remaining = amount_cents - total_cents_from_counts(out)
-    if remaining < 0:
-        return out, remaining
+def compute_caisse_today(df: pd.DataFrame, target_cents: int, overrides: dict):
+    # sanitize inputs
+    for col in ["OPEN", "CLOSE", "RETRAIT"]:
+        df[col] = df[col].map(safe_int)
 
-    remaining = take_greedy(remaining, priority, avail, out, locked or {})
-    return out, remaining
-
-def ensure_caisse_df_today():
-    # Columns: Denom | OPEN | CLOSE | LOCK | RETRAIT_LOCK | RETRAIT | RESTANT
-    df = pd.DataFrame({
-        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
-        "OPEN": [0]*len(DISPLAY_ORDER) + [0],
-        "CLOSE": [0]*len(DISPLAY_ORDER) + [0],
-        "LOCK": [False]*len(DISPLAY_ORDER) + [False],
-        "RETRAIT_LOCK": [0]*len(DISPLAY_ORDER) + [0],
-        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0],
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0],
-    })
-    return df
-
-def ensure_caisse_df_yesterday():
-    df = pd.DataFrame({
-        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
-        "CLOSE": [0]*len(DISPLAY_ORDER) + [0],
-        "LOCK": [False]*len(DISPLAY_ORDER) + [False],
-        "RETRAIT_LOCK": [0]*len(DISPLAY_ORDER) + [0],
-        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0],
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0],
-    })
-    return df
-
-def ensure_boite_df():
-    df = pd.DataFrame({
-        "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
-        "OPEN": [0]*len(DISPLAY_ORDER) + [0],
-        "AJOUTÉ": [0]*len(DISPLAY_ORDER) + [0],
-        "LOCK": [False]*len(DISPLAY_ORDER) + [False],
-        "RETRAIT_LOCK": [0]*len(DISPLAY_ORDER) + [0],
-        "RETRAIT (en change)": [0]*len(DISPLAY_ORDER) + [0],
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0],
-    })
-    return df
-
-def locked_from_df(df: pd.DataFrame) -> dict:
-    locked = {}
-    for _, r in df.iterrows():
-        denom = str(r.get("Dénomination", ""))
-        if denom in DISPLAY_ORDER and bool(r.get("LOCK", False)):
-            locked[denom] = safe_int(r.get("RETRAIT_LOCK", 0))
-    return locked
-
-
-def compute_caisse_today_inplace(df: pd.DataFrame, target_cents: int, allow_open_edit: bool):
-    # sanitise inputs
-    for col in ["OPEN", "CLOSE", "RETRAIT_LOCK", "RETRAIT", "RESTANT"]:
-        if col in df.columns:
-            df[col] = df[col].map(safe_int)
-
-    # ignore total row in computations
-    base = df[df["Dénomination"].isin(DISPLAY_ORDER)].copy()
-
-    open_counts = {k: int(base.loc[base["Dénomination"] == k, "OPEN"].values[0]) for k in DISPLAY_ORDER}
-    close_counts = {k: int(base.loc[base["Dénomination"] == k, "CLOSE"].values[0]) for k in DISPLAY_ORDER}
+    open_counts = {k: int(df.loc[df["Dénomination"] == k, "OPEN"].values[0]) for k in DISPLAY_ORDER}
+    close_counts = {k: int(df.loc[df["Dénomination"] == k, "CLOSE"].values[0]) for k in DISPLAY_ORDER}
 
     diff = total_cents_from_counts(close_counts) - target_cents
+    if diff <= 0:
+        retrait = {k: 0 for k in DISPLAY_ORDER}
+    else:
+        overrides = clamp_override(overrides, close_counts)
+        retrait = greedy_fill(diff, close_counts, overrides, PRIORITY_CAISSE)
 
-    locked = clamp_locked_counts(locked_from_df(base), close_counts)
-    retrait = {k: 0 for k in DISPLAY_ORDER}
-    restant = close_counts.copy()
-    remaining = 0
+    # compute restant
+    restant = {k: int(close_counts[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
 
-    if diff > 0:
-        retrait, remaining = suggest_retrait(diff, close_counts, locked, PRIORITY_CAISSE)
-        restant = {k: int(close_counts[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
-
-    # write computed columns back into df for denom rows
+    # write back computed + keep user's RETRAIT visible
     for k in DISPLAY_ORDER:
         df.loc[df["Dénomination"] == k, "RETRAIT"] = int(retrait.get(k, 0))
         df.loc[df["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
 
-    # totals row
+    # totals row ($)
     total_open = total_cents_from_counts(open_counts)
     total_close = total_cents_from_counts(close_counts)
-    total_retrait = total_cents_from_counts(retrait)
-    total_restant = total_cents_from_counts(restant)
+    total_ret = total_cents_from_counts(retrait)
+    total_res = total_cents_from_counts(restant)
 
     df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "OPEN"] = round(total_open/100, 2)
     df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "CLOSE"] = round(total_close/100, 2)
-    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT"] = round(total_retrait/100, 2)
-    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_restant/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT"] = round(total_ret/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_res/100, 2)
 
-    # keep totals row locks clean
-    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "LOCK"] = False
-    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT_LOCK"] = 0
+    leftover = (diff - total_ret) if diff > 0 else 0
+    return open_counts, close_counts, retrait, restant, diff, leftover, overrides
 
-    return diff, remaining, open_counts, close_counts, retrait, restant
+def compute_caisse_yesterday(df: pd.DataFrame, target_cents: int, overrides: dict):
+    for col in ["CLOSE", "RETRAIT"]:
+        df[col] = df[col].map(safe_int)
 
-
-def compute_caisse_yesterday_inplace(df_y: pd.DataFrame, target_cents: int):
-    for col in ["CLOSE", "RETRAIT_LOCK", "RETRAIT", "RESTANT"]:
-        df_y[col] = df_y[col].map(safe_int)
-
-    base = df_y[df_y["Dénomination"].isin(DISPLAY_ORDER)].copy()
-    close_counts = {k: int(base.loc[base["Dénomination"] == k, "CLOSE"].values[0]) for k in DISPLAY_ORDER}
-
+    close_counts = {k: int(df.loc[df["Dénomination"] == k, "CLOSE"].values[0]) for k in DISPLAY_ORDER}
     diff = total_cents_from_counts(close_counts) - target_cents
-    locked = clamp_locked_counts(locked_from_df(base), close_counts)
 
-    retrait = {k: 0 for k in DISPLAY_ORDER}
-    restant = close_counts.copy()
-    remaining = 0
+    if diff <= 0:
+        retrait = {k: 0 for k in DISPLAY_ORDER}
+    else:
+        overrides = clamp_override(overrides, close_counts)
+        retrait = greedy_fill(diff, close_counts, overrides, PRIORITY_CAISSE)
 
-    if diff > 0:
-        retrait, remaining = suggest_retrait(diff, close_counts, locked, PRIORITY_CAISSE)
-        restant = {k: int(close_counts[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
-
-    for k in DISPLAY_ORDER:
-        df_y.loc[df_y["Dénomination"] == k, "RETRAIT"] = int(retrait.get(k, 0))
-        df_y.loc[df_y["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
-
-    df_y.loc[df_y["Dénomination"] == TOTAL_ROW_LABEL, "CLOSE"] = round(total_cents_from_counts(close_counts)/100, 2)
-    df_y.loc[df_y["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT"] = round(total_cents_from_counts(retrait)/100, 2)
-    df_y.loc[df_y["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_cents_from_counts(restant)/100, 2)
-    df_y.loc[df_y["Dénomination"] == TOTAL_ROW_LABEL, "LOCK"] = False
-    df_y.loc[df_y["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT_LOCK"] = 0
-
-    return diff, remaining, close_counts, retrait, restant
-
-
-def compute_boite_inplace(df_b: pd.DataFrame):
-    for col in ["OPEN", "AJOUTÉ", "RETRAIT_LOCK", "RETRAIT (en change)", "RESTANT"]:
-        df_b[col] = df_b[col].map(safe_int)
-
-    base = df_b[df_b["Dénomination"].isin(DISPLAY_ORDER)].copy()
-    open_counts = {k: int(base.loc[base["Dénomination"] == k, "OPEN"].values[0]) for k in DISPLAY_ORDER}
-    ajoute_counts = {k: int(base.loc[base["Dénomination"] == k, "AJOUTÉ"].values[0]) for k in DISPLAY_ORDER}
-
-    after_add = {k: int(open_counts[k]) + int(ajoute_counts[k]) for k in DISPLAY_ORDER}
-    total_ajoute = total_cents_from_counts(ajoute_counts)
-
-    locked = clamp_locked_counts(locked_from_df(base), after_add)
-
-    retrait = {k: 0 for k in DISPLAY_ORDER}
-    restant = after_add.copy()
-    remaining = 0
-
-    if total_ajoute > 0:
-        retrait, remaining = suggest_retrait(total_ajoute, after_add, locked, PRIORITY_BOITE)
-        restant = {k: int(after_add[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
+    restant = {k: int(close_counts[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
 
     for k in DISPLAY_ORDER:
-        df_b.loc[df_b["Dénomination"] == k, "RETRAIT (en change)"] = int(retrait.get(k, 0))
-        df_b.loc[df_b["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
+        df.loc[df["Dénomination"] == k, "RETRAIT"] = int(retrait.get(k, 0))
+        df.loc[df["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
 
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "OPEN"] = round(total_cents_from_counts(open_counts)/100, 2)
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "AJOUTÉ"] = round(total_cents_from_counts(ajoute_counts)/100, 2)
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT (en change)"] = round(total_cents_from_counts(retrait)/100, 2)
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_cents_from_counts(restant)/100, 2)
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "LOCK"] = False
-    df_b.loc[df_b["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT_LOCK"] = 0
+    total_close = total_cents_from_counts(close_counts)
+    total_ret = total_cents_from_counts(retrait)
+    total_res = total_cents_from_counts(restant)
 
-    return total_ajoute, remaining, open_counts, ajoute_counts, retrait, restant
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "CLOSE"] = round(total_close/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT"] = round(total_ret/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_res/100, 2)
 
+    leftover = (diff - total_ret) if diff > 0 else 0
+    return close_counts, retrait, restant, diff, leftover, overrides
+
+def compute_boite(df: pd.DataFrame, overrides: dict):
+    for col in ["OPEN", "AJOUTÉ", "RETRAIT (en change)"]:
+        df[col] = df[col].map(safe_int)
+
+    open_counts = {k: int(df.loc[df["Dénomination"] == k, "OPEN"].values[0]) for k in DISPLAY_ORDER}
+    add_counts = {k: int(df.loc[df["Dénomination"] == k, "AJOUTÉ"].values[0]) for k in DISPLAY_ORDER}
+
+    after_add = {k: int(open_counts[k]) + int(add_counts[k]) for k in DISPLAY_ORDER}
+    total_add = total_cents_from_counts(add_counts)
+
+    if total_add <= 0:
+        retrait = {k: 0 for k in DISPLAY_ORDER}
+    else:
+        overrides = clamp_override(overrides, after_add)
+        retrait = greedy_fill(total_add, after_add, overrides, PRIORITY_BOITE)
+
+    restant = {k: int(after_add[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
+
+    for k in DISPLAY_ORDER:
+        df.loc[df["Dénomination"] == k, "RETRAIT (en change)"] = int(retrait.get(k, 0))
+        df.loc[df["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
+
+    total_open = total_cents_from_counts(open_counts)
+    total_ret = total_cents_from_counts(retrait)
+    total_res = total_cents_from_counts(restant)
+
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "OPEN"] = round(total_open/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "AJOUTÉ"] = round(total_add/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RETRAIT (en change)"] = round(total_ret/100, 2)
+    df.loc[df["Dénomination"] == TOTAL_ROW_LABEL, "RESTANT"] = round(total_res/100, 2)
+
+    leftover = total_add - total_ret if total_add > 0 else 0
+    return open_counts, add_counts, retrait, restant, total_add, leftover, overrides
 
 # ================== AUTH ==================
-if "auth" not in st.session_state:
-    st.session_state.auth = False
-
+st.session_state.setdefault("auth", False)
 if not st.session_state.auth:
     st.title("Accès protégé")
     pwd = st.text_input("Mot de passe", type="password", key="pwd")
@@ -418,11 +364,16 @@ yesterday = today - timedelta(days=1)
 st.session_state.setdefault("cashier", "")
 st.session_state.setdefault("register_no", 1)
 st.session_state.setdefault("target_dollars", 200)
-st.session_state.setdefault("mode_pick", "normal")  # normal/missed_close
+st.session_state.setdefault("mode_pick", "normal")
 
-st.session_state.setdefault("caisse_today_df", ensure_caisse_df_today())
-st.session_state.setdefault("caisse_yesterday_df", ensure_caisse_df_yesterday())
-st.session_state.setdefault("boite_df", ensure_boite_df())
+st.session_state.setdefault("df_caisse_today", ensure_df_caisse_today())
+st.session_state.setdefault("df_caisse_yesterday", ensure_df_caisse_yesterday())
+st.session_state.setdefault("df_boite", ensure_df_boite())
+
+# Overrides stored separately (invisible to user)
+st.session_state.setdefault("over_caisse_today", {})       # denom -> count
+st.session_state.setdefault("over_caisse_yesterday", {})
+st.session_state.setdefault("over_boite", {})
 
 st.session_state.setdefault("last_hash_caisse", None)
 st.session_state.setdefault("last_hash_boite", None)
@@ -430,7 +381,6 @@ st.session_state.setdefault("last_hash_boite", None)
 # Load saved once per day
 if st.session_state.get("booted_for") != today.isoformat():
     st.session_state["booted_for"] = today.isoformat()
-
     sp, _ = caisse_paths(today)
     saved = load_json(sp)
     if saved:
@@ -439,15 +389,20 @@ if st.session_state.get("booted_for") != today.isoformat():
         st.session_state.register_no = int(meta.get("Caisse #", st.session_state.register_no))
         st.session_state.target_dollars = int(meta.get("Cible $", st.session_state.target_dollars))
         st.session_state.mode_pick = saved.get("mode_pick", st.session_state.mode_pick)
-        if "caisse_today_df" in saved:
-            st.session_state.caisse_today_df = pd.DataFrame(saved["caisse_today_df"])
-        if "caisse_yesterday_df" in saved:
-            st.session_state.caisse_yesterday_df = pd.DataFrame(saved["caisse_yesterday_df"])
+
+        if "df_caisse_today" in saved:
+            st.session_state.df_caisse_today = pd.DataFrame(saved["df_caisse_today"])
+        if "df_caisse_yesterday" in saved:
+            st.session_state.df_caisse_yesterday = pd.DataFrame(saved["df_caisse_yesterday"])
+        st.session_state.over_caisse_today = saved.get("over_caisse_today", {}) or {}
+        st.session_state.over_caisse_yesterday = saved.get("over_caisse_yesterday", {}) or {}
 
     spb, _ = boite_paths(today)
     savedb = load_json(spb)
-    if savedb and "boite_df" in savedb:
-        st.session_state.boite_df = pd.DataFrame(savedb["boite_df"])
+    if savedb:
+        if "df_boite" in savedb:
+            st.session_state.df_boite = pd.DataFrame(savedb["df_boite"])
+        st.session_state.over_boite = savedb.get("over_boite", {}) or {}
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
@@ -468,7 +423,6 @@ TARGET = int(st.session_state.target_dollars) * 100
 st.divider()
 tab_caisse, tab_boite, tab_save = st.tabs(["Caisse", "Boîte (Échange)", "Sauvegarde & reçus"])
 
-
 # ================== TAB: CAISSE ==================
 with tab_caisse:
     st.subheader("Caisse")
@@ -480,70 +434,81 @@ with tab_caisse:
         key="mode_dropdown",
     )
     st.session_state.mode_pick = "normal" if mode == "Ouverture normale" else "missed_close"
-    st.caption("Pour forcer un retrait: coche LOCK ✅ et mets RETRAIT_LOCK (mets 0 pour refuser une coupure). Décoche LOCK pour déverrouiller.")
 
-    # --- Yesterday block (only if missed_close)
-    restant_y = {k: 0 for k in DISPLAY_ORDER}
-    rep_y_rows = None
-
-    if st.session_state.mode_pick == "missed_close":
-        st.markdown("### Hier — fermeture non effectuée")
-
-        df_y = st.session_state.caisse_yesterday_df.copy()
-
-        edited_y = st.data_editor(
-            df_y,
-            use_container_width=True,
-            hide_index=True,
-            key="editor_caisse_y",
-            height=editor_height(len(df_y)),
-            column_config={
-                "Dénomination": st.column_config.TextColumn(width="large"),
-                "CLOSE": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-                "LOCK": st.column_config.CheckboxColumn(width="small"),
-                "RETRAIT_LOCK": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-                "RETRAIT": st.column_config.NumberColumn(width="small"),
-                "RESTANT": st.column_config.NumberColumn(width="small"),
-            },
-            disabled=["Dénomination", "RETRAIT", "RESTANT"],  # computed
-        )
-
-        if st.button("✅ Appliquer (hier)", use_container_width=True, key="apply_y"):
-            # Store edits
-            st.session_state.caisse_yesterday_df = edited_y.copy()
-            # Compute in-place into stored df
-            diff_y, remaining_y, close_y, retrait_y, restant_y = compute_caisse_yesterday_inplace(st.session_state.caisse_yesterday_df, TARGET)
+    # Reset overrides button (unlock without lock UI)
+    cA, cB = st.columns([1, 3])
+    with cA:
+        if st.button("↩️ Réinitialiser les retraits", use_container_width=True):
+            st.session_state.over_caisse_today = {}
+            st.session_state.over_caisse_yesterday = {}
             st.rerun()
+    with cB:
+        st.caption("Pour changer la proposition, modifie les chiffres dans RETRAIT (ex: mets 0 sur Billet 100 $). L’app recalculera le reste automatiquement.")
 
-        # compute current display (without forcing rerun)
-        diff_y, remaining_y, close_y, retrait_y, restant_y = compute_caisse_yesterday_inplace(st.session_state.caisse_yesterday_df, TARGET)
+    restant_y = {k: 0 for k in DISPLAY_ORDER}
 
-        if diff_y <= 0:
-            st.info("Hier: sous la cible (ou égal). Aucun retrait.")
-        else:
-            if remaining_y == 0:
-                st.success(f"À retirer (hier): {cents_to_str(diff_y)}")
-            elif remaining_y < 0:
-                st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_y))
+    # ---- Yesterday (only if missed_close). Kept in an expander so you’re not “scrolling forever”.
+    if st.session_state.mode_pick == "missed_close":
+        with st.expander("Hier — fermeture non effectuée", expanded=True):
+            df_y = st.session_state.df_caisse_yesterday.copy()
+
+            edited_y = st.data_editor(
+                df_y,
+                use_container_width=True,
+                hide_index=True,
+                key="editor_caisse_y",
+                height=editor_height(len(df_y)),
+                column_config={
+                    "Dénomination": st.column_config.TextColumn(width="large"),
+                    "CLOSE": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
+                    "RETRAIT": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
+                    "RESTANT": st.column_config.NumberColumn(width="small"),
+                },
+                disabled=["Dénomination", "RESTANT"],
+            )
+
+            if st.button("✅ Appliquer (hier)", use_container_width=True, key="apply_y"):
+                # Save edits first
+                st.session_state.df_caisse_yesterday = edited_y.copy()
+                # Update overrides from user-edited RETRAIT (implicit)
+                over = {}
+                for k in DISPLAY_ORDER:
+                    over[k] = safe_int(edited_y.loc[edited_y["Dénomination"] == k, "RETRAIT"].values[0])
+                st.session_state.over_caisse_yesterday = over
+
+                # Recompute to refresh table values
+                _, _, restant_y, diff_y, leftover_y, _ = compute_caisse_yesterday(
+                    st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
+                )
+                st.rerun()
+
+            close_y, retrait_y, restant_y, diff_y, leftover_y, _ = compute_caisse_yesterday(
+                st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
+            )
+
+            if diff_y <= 0:
+                st.info("Hier: sous la cible (ou égal). Aucun retrait requis.")
             else:
-                st.warning("Impossible exact. Reste: " + cents_to_str(remaining_y))
+                if leftover_y == 0:
+                    st.success(f"Hier OK. À retirer: {cents_to_str(diff_y)}")
+                elif leftover_y > 0:
+                    st.warning(f"Hier: il manque {cents_to_str(leftover_y)} à retirer.")
+                else:
+                    st.warning(f"Hier: tu as retiré {cents_to_str(-leftover_y)} de trop.")
 
-        # Auto-fill OPEN today with RESTANT yesterday (stored df only)
-        df_t = st.session_state.caisse_today_df
+        # Pre-fill OPEN today from RESTANT yesterday
+        df_t = st.session_state.df_caisse_today
         for k in DISPLAY_ORDER:
             df_t.loc[df_t["Dénomination"] == k, "OPEN"] = int(restant_y.get(k, 0))
-        st.session_state.caisse_today_df = df_t
+        st.session_state.df_caisse_today = df_t
 
-        st.divider()
-
-    # --- Today
     st.markdown("### Aujourd'hui")
 
-    df_t = st.session_state.caisse_today_df.copy()
+    df_t = st.session_state.df_caisse_today.copy()
 
-    disable_cols = ["Dénomination", "RETRAIT", "RESTANT"]
+    disabled_cols = ["Dénomination", "RESTANT"]
     if st.session_state.mode_pick != "normal":
-        disable_cols.append("OPEN")  # auto
+        disabled_cols.append("OPEN")
 
     edited_t = st.data_editor(
         df_t,
@@ -555,36 +520,36 @@ with tab_caisse:
             "Dénomination": st.column_config.TextColumn(width="large"),
             "OPEN": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
             "CLOSE": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-            "LOCK": st.column_config.CheckboxColumn(width="small"),
-            "RETRAIT_LOCK": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-            "RETRAIT": st.column_config.NumberColumn(width="small"),
+            "RETRAIT": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
             "RESTANT": st.column_config.NumberColumn(width="small"),
         },
-        disabled=disable_cols,
+        disabled=disabled_cols,
     )
 
     if st.button("✅ Appliquer (aujourd'hui)", use_container_width=True, key="apply_t"):
-        st.session_state.caisse_today_df = edited_t.copy()
-        diff_t, remaining_t, open_t, close_t, retrait_t, restant_t = compute_caisse_today_inplace(
-            st.session_state.caisse_today_df, TARGET, allow_open_edit=(st.session_state.mode_pick == "normal")
-        )
+        st.session_state.df_caisse_today = edited_t.copy()
+        over = {}
+        for k in DISPLAY_ORDER:
+            over[k] = safe_int(edited_t.loc[edited_t["Dénomination"] == k, "RETRAIT"].values[0])
+        st.session_state.over_caisse_today = over
+        compute_caisse_today(st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today)
         st.rerun()
 
-    diff_t, remaining_t, open_t, close_t, retrait_t, restant_t = compute_caisse_today_inplace(
-        st.session_state.caisse_today_df, TARGET, allow_open_edit=(st.session_state.mode_pick == "normal")
+    open_t, close_t, retrait_t, restant_t, diff_t, leftover_t, _ = compute_caisse_today(
+        st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
     )
 
     if diff_t <= 0:
-        st.info("Sous la cible (ou égal). Aucun retrait.")
+        st.info("Sous la cible (ou égal). Aucun retrait requis.")
     else:
-        if remaining_t == 0:
-            st.success(f"À retirer: {cents_to_str(diff_t)}")
-        elif remaining_t < 0:
-            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_t))
+        if leftover_t == 0:
+            st.success(f"OK. À retirer: {cents_to_str(diff_t)}")
+        elif leftover_t > 0:
+            st.warning(f"Il manque {cents_to_str(leftover_t)} à retirer.")
         else:
-            st.warning("Impossible exact. Reste: " + cents_to_str(remaining_t))
+            st.warning(f"Tu as retiré {cents_to_str(-leftover_t)} de trop.")
 
-    # Receipt + autosave
+    # Receipt + save
     meta_caisse = {
         "Type": "CAISSE",
         "Date": today.isoformat(),
@@ -615,8 +580,10 @@ with tab_caisse:
     payload_caisse = {
         "meta": meta_caisse,
         "mode_pick": st.session_state.mode_pick,
-        "caisse_today_df": st.session_state.caisse_today_df.to_dict(orient="records"),
-        "caisse_yesterday_df": st.session_state.caisse_yesterday_df.to_dict(orient="records"),
+        "df_caisse_today": st.session_state.df_caisse_today.to_dict(orient="records"),
+        "df_caisse_yesterday": st.session_state.df_caisse_yesterday.to_dict(orient="records"),
+        "over_caisse_today": st.session_state.over_caisse_today,
+        "over_caisse_yesterday": st.session_state.over_caisse_yesterday,
         "rows_today": rows_today,
     }
 
@@ -631,13 +598,19 @@ with tab_caisse:
     with st.expander("Aperçu reçu — Caisse", expanded=False):
         components.html(load_text(receipt_path) or html, height=560, scrolling=True)
 
-
 # ================== TAB: BOÎTE ==================
 with tab_boite:
     st.subheader("Boîte (Échange)")
-    st.caption("Même logique. Ajuste le change via LOCK ✅ + RETRAIT_LOCK. Décoche LOCK pour déverrouiller.")
 
-    df_b = st.session_state.boite_df.copy()
+    cA, cB = st.columns([1, 3])
+    with cA:
+        if st.button("↩️ Réinitialiser change", use_container_width=True):
+            st.session_state.over_boite = {}
+            st.rerun()
+    with cB:
+        st.caption("Modifie RETRAIT (en change) pour forcer une répartition. L’app recalculera le reste automatiquement.")
+
+    df_b = st.session_state.df_boite.copy()
 
     edited_b = st.data_editor(
         df_b,
@@ -649,30 +622,34 @@ with tab_boite:
             "Dénomination": st.column_config.TextColumn(width="large"),
             "OPEN": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
             "AJOUTÉ": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-            "LOCK": st.column_config.CheckboxColumn(width="small"),
-            "RETRAIT_LOCK": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
-            "RETRAIT (en change)": st.column_config.NumberColumn(width="small"),
+            "RETRAIT (en change)": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
             "RESTANT": st.column_config.NumberColumn(width="small"),
         },
-        disabled=["Dénomination", "RETRAIT (en change)", "RESTANT"],
+        disabled=["Dénomination", "RESTANT"],
     )
 
     if st.button("✅ Appliquer (boîte)", use_container_width=True, key="apply_b"):
-        st.session_state.boite_df = edited_b.copy()
-        total_ajoute, remaining_b, open_b, ajoute_b, retrait_b, restant_b = compute_boite_inplace(st.session_state.boite_df)
+        st.session_state.df_boite = edited_b.copy()
+        over = {}
+        for k in DISPLAY_ORDER:
+            over[k] = safe_int(edited_b.loc[edited_b["Dénomination"] == k, "RETRAIT (en change)"].values[0])
+        st.session_state.over_boite = over
+        compute_boite(st.session_state.df_boite, st.session_state.over_boite)
         st.rerun()
 
-    total_ajoute, remaining_b, open_b, ajoute_b, retrait_b, restant_b = compute_boite_inplace(st.session_state.boite_df)
+    open_b, add_b, ret_b, res_b, total_add, leftover_b, _ = compute_boite(
+        st.session_state.df_boite, st.session_state.over_boite
+    )
 
-    if total_ajoute == 0:
-        st.info("AJOUTÉ = 0. Rien à calculer.")
+    if total_add <= 0:
+        st.info("AJOUTÉ = 0. Rien à équilibrer.")
     else:
-        if remaining_b == 0:
-            st.success(f"Change à retirer: {cents_to_str(total_ajoute)}")
-        elif remaining_b < 0:
-            st.warning("Verrouillage trop haut. Dépasse de " + cents_to_str(-remaining_b))
+        if leftover_b == 0:
+            st.success(f"OK. Change retiré = Ajouté: {cents_to_str(total_add)}")
+        elif leftover_b > 0:
+            st.warning(f"Il manque {cents_to_str(leftover_b)} à retirer.")
         else:
-            st.warning("Impossible exact. Reste: " + cents_to_str(remaining_b))
+            st.warning(f"Tu as retiré {cents_to_str(-leftover_b)} de trop.")
 
     meta_boite = {
         "Type": "BOÎTE (ÉCHANGE)",
@@ -680,7 +657,7 @@ with tab_boite:
         "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Caisse #": int(st.session_state.register_no),
-        "Ajouté total ($)": f"{total_ajoute/100:.2f}",
+        "Ajouté total ($)": f"{total_add/100:.2f}",
     }
 
     rows_boite = []
@@ -688,21 +665,22 @@ with tab_boite:
         rows_boite.append({
             "Dénomination": k,
             "OPEN": int(open_b.get(k, 0)),
-            "AJOUTÉ": int(ajoute_b.get(k, 0)),
-            "RETRAIT (en change)": int(retrait_b.get(k, 0)),
-            "RESTANT": int(restant_b.get(k, 0)),
+            "AJOUTÉ": int(add_b.get(k, 0)),
+            "RETRAIT (en change)": int(ret_b.get(k, 0)),
+            "RESTANT": int(res_b.get(k, 0)),
         })
     rows_boite.append({
         "Dénomination": "TOTAL ($)",
         "OPEN": f"{total_cents_from_counts(open_b)/100:.2f}",
-        "AJOUTÉ": f"{total_cents_from_counts(ajoute_b)/100:.2f}",
-        "RETRAIT (en change)": f"{total_cents_from_counts(retrait_b)/100:.2f}",
-        "RESTANT": f"{total_cents_from_counts(restant_b)/100:.2f}",
+        "AJOUTÉ": f"{total_cents_from_counts(add_b)/100:.2f}",
+        "RETRAIT (en change)": f"{total_cents_from_counts(ret_b)/100:.2f}",
+        "RESTANT": f"{total_cents_from_counts(res_b)/100:.2f}",
     })
 
     payload_boite = {
         "meta": meta_boite,
-        "boite_df": st.session_state.boite_df.to_dict(orient="records"),
+        "df_boite": st.session_state.df_boite.to_dict(orient="records"),
+        "over_boite": st.session_state.over_boite,
         "rows": rows_boite,
     }
 
@@ -722,11 +700,13 @@ with tab_boite:
     with st.expander("Aperçu reçu — Boîte (Échange)", expanded=False):
         components.html(load_text(receipt_path_b) or htmlb, height=560, scrolling=True)
 
-
 # ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
-    st.caption("Clique une date pour voir le reçu détaillé et télécharger les fichiers.")
+
+    def list_dates(folder: str):
+        files = sorted([f for f in os.listdir(folder) if f.endswith("_state.json")])
+        return [f.replace("_state.json", "") for f in files]
 
     colA, colB = st.columns(2)
 
@@ -743,8 +723,6 @@ with tab_save:
                     html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    else:
-                        st.warning("Reçu introuvable.")
                     if os.path.exists(receipt_path):
                         with open(receipt_path, "rb") as f:
                             st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_c_html_{ds}")
@@ -765,8 +743,6 @@ with tab_save:
                     html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    else:
-                        st.warning("Reçu introuvable.")
                     if os.path.exists(receipt_path):
                         with open(receipt_path, "rb") as f:
                             st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_b_html_{ds}")
