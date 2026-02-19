@@ -1,13 +1,14 @@
-# caisse_one_table_autosuggest.py
-# Registre — Caisse & Boîte
-# ONE table per tab (no extra result table)
+# caisse_three_registers_autosuggest.py
+# Registre — Caisse & Boîte de monnaie
 #
-# FIX INCLUDED:
-# ✅ RETRAIT auto-suggest works again (no more “everything locked at 0”)
-# ✅ Overrides are SPARSE: we only store overrides for rows the user actually edited in RETRAIT
-# ✅ Legacy saved overrides (full dict of zeros) are auto-cleaned on load
-# ✅ If user edits RETRAIT back to the suggested value -> override removed (“unlock”)
-# ✅ Editor shows the suggestion-filled df (compute runs before editor uses session df)
+# ✅ 3 caisses IDENTIQUES (Caisse 1 / Caisse 2 / Caisse 3) — séparées, pas de selectbox
+# ✅ Chaque caisse a ses propres données (today/yesterday/overrides/mode) + ses propres fichiers sauvegardés
+# ✅ RETRAIT auto-suggéré pour atteindre la cible (TARGET) sans être bloqué par des overrides “legacy”
+# ✅ Overrides = SPARSE: seulement les lignes réellement modifiées dans RETRAIT
+# ✅ Remettre la valeur suggérée = "unlock" automatique
+# ✅ Boîte (Échange) reste globale (1 seule), comme avant
+#
+# Note: Toute la logique de suggestion vient de compute_* déjà validée.
 
 import os
 import json
@@ -88,7 +89,7 @@ DISPLAY_ORDER = (
 )
 TOTAL_ROW_LABEL = "TOTAL ($)"
 
-PRIORITY_CAISSE = DISPLAY_ORDER[:]  # big -> small already
+PRIORITY_CAISSE = DISPLAY_ORDER[:]  # big -> small
 PRIORITY_BOITE = (
     ["Billet 20 $", "Billet 10 $", "Billet 5 $"]
     + ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
@@ -177,11 +178,12 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
     </body></html>
     """
 
-def caisse_paths(d: date):
+def caisse_paths(d: date, register_no: int):
     ds = d.isoformat()
+    reg = int(register_no)
     return (
-        os.path.join(DIR_CAISSE, f"{ds}_state.json"),
-        os.path.join(DIR_CAISSE, f"{ds}_receipt.html"),
+        os.path.join(DIR_CAISSE, f"{ds}_caisse{reg}_state.json"),
+        os.path.join(DIR_CAISSE, f"{ds}_caisse{reg}_receipt.html"),
     )
 
 def boite_paths(d: date):
@@ -196,8 +198,8 @@ def ensure_df_caisse_today():
         "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
         "OPEN": [0]*len(DISPLAY_ORDER) + [0.0],
         "CLOSE": [0]*len(DISPLAY_ORDER) + [0.0],
-        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # shown (suggested), can be edited
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],   # computed
+        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],
     })
 
 def ensure_df_caisse_yesterday():
@@ -230,7 +232,7 @@ def clamp_override(override: dict, avail: dict) -> dict:
     return out
 
 def greedy_fill(remaining_cents: int, avail_counts: dict, fixed_counts: dict, priority: list) -> dict:
-    out = {k: int(fixed_counts.get(k, 0)) for k in DISPLAY_ORDER}
+    out = {k: int((fixed_counts or {}).get(k, 0)) for k in DISPLAY_ORDER}
     fixed_keys = set(k for k, v in (fixed_counts or {}).items() if v is not None)
 
     rem = remaining_cents - total_cents_from_counts(out)
@@ -354,21 +356,15 @@ def idx_to_denom_map(df_display: pd.DataFrame) -> dict:
     return {i: str(df_display.iloc[i]["Dénomination"]) for i in range(len(df_display))}
 
 def cleanup_legacy_overrides(over: dict) -> dict:
-    """
-    Legacy behaviour saved overrides for EVERY denom (often 0),
-    which locks the suggestion algo (because everything becomes fixed_keys).
-    New behaviour: sparse overrides (only what the user edited).
-    """
     if not isinstance(over, dict):
         return {}
-    # Drop unknown keys and normalise ints
     cleaned = {k: safe_int(v) for k, v in over.items() if k in DISPLAY_ORDER}
-
-    # If it's “full dict” and all zeros -> nuke it
     if len(cleaned) >= len(DISPLAY_ORDER) and all(int(v) == 0 for v in cleaned.values()):
         return {}
-
     return cleaned
+
+def kreg(base: str, reg: int) -> str:
+    return f"{base}_{int(reg)}"
 
 # ================== AUTH ==================
 st.session_state.setdefault("auth", False)
@@ -388,43 +384,49 @@ today = datetime.now(TZ).date()
 yesterday = today - timedelta(days=1)
 
 st.session_state.setdefault("cashier", "")
-st.session_state.setdefault("register_no", 1)
 st.session_state.setdefault("target_dollars", 200)
-st.session_state.setdefault("mode_pick", "normal")
 
-st.session_state.setdefault("df_caisse_today", ensure_df_caisse_today())
-st.session_state.setdefault("df_caisse_yesterday", ensure_df_caisse_yesterday())
+# Per-register caisse state (1..3)
+for reg in (1, 2, 3):
+    st.session_state.setdefault(kreg("mode_pick", reg), "normal")
+    st.session_state.setdefault(kreg("df_caisse_today", reg), ensure_df_caisse_today())
+    st.session_state.setdefault(kreg("df_caisse_yesterday", reg), ensure_df_caisse_yesterday())
+    st.session_state.setdefault(kreg("over_caisse_today", reg), {})
+    st.session_state.setdefault(kreg("over_caisse_yesterday", reg), {})
+
+# Boîte state (global)
 st.session_state.setdefault("df_boite", ensure_df_boite())
-
-# Overrides (sparse)
-st.session_state.setdefault("over_caisse_today", {})
-st.session_state.setdefault("over_caisse_yesterday", {})
 st.session_state.setdefault("over_boite", {})
 
-st.session_state.setdefault("last_hash_caisse", None)
+st.session_state.setdefault("last_hash_caisse_1", None)
+st.session_state.setdefault("last_hash_caisse_2", None)
+st.session_state.setdefault("last_hash_caisse_3", None)
 st.session_state.setdefault("last_hash_boite", None)
 
-# Load saved once per day
+# Load saved once per day (per register)
 if st.session_state.get("booted_for") != today.isoformat():
     st.session_state["booted_for"] = today.isoformat()
 
-    sp, _ = caisse_paths(today)
-    saved = load_json(sp)
-    if saved:
-        meta = saved.get("meta", {})
-        st.session_state.cashier = meta.get("Caissier(ère)", st.session_state.cashier)
-        st.session_state.register_no = int(meta.get("Caisse #", st.session_state.register_no))
-        st.session_state.target_dollars = int(meta.get("Cible $", st.session_state.target_dollars))
-        st.session_state.mode_pick = saved.get("mode_pick", st.session_state.mode_pick)
+    # Load caisses 1..3
+    for reg in (1, 2, 3):
+        sp, _ = caisse_paths(today, reg)
+        saved = load_json(sp)
+        if saved:
+            meta = saved.get("meta", {})
+            st.session_state.cashier = meta.get("Caissier(ère)", st.session_state.cashier)
+            st.session_state.target_dollars = int(meta.get("Cible $", st.session_state.target_dollars))
 
-        if "df_caisse_today" in saved:
-            st.session_state.df_caisse_today = pd.DataFrame(saved["df_caisse_today"])
-        if "df_caisse_yesterday" in saved:
-            st.session_state.df_caisse_yesterday = pd.DataFrame(saved["df_caisse_yesterday"])
+            st.session_state[kreg("mode_pick", reg)] = saved.get("mode_pick", st.session_state[kreg("mode_pick", reg)])
 
-        st.session_state.over_caisse_today = cleanup_legacy_overrides(saved.get("over_caisse_today", {}) or {})
-        st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(saved.get("over_caisse_yesterday", {}) or {})
+            if "df_caisse_today" in saved:
+                st.session_state[kreg("df_caisse_today", reg)] = pd.DataFrame(saved["df_caisse_today"])
+            if "df_caisse_yesterday" in saved:
+                st.session_state[kreg("df_caisse_yesterday", reg)] = pd.DataFrame(saved["df_caisse_yesterday"])
 
+            st.session_state[kreg("over_caisse_today", reg)] = cleanup_legacy_overrides(saved.get("over_caisse_today", {}) or {})
+            st.session_state[kreg("over_caisse_yesterday", reg)] = cleanup_legacy_overrides(saved.get("over_caisse_yesterday", {}) or {})
+
+    # Load boîte (global)
     spb, _ = boite_paths(today)
     savedb = load_json(spb)
     if savedb:
@@ -432,54 +434,63 @@ if st.session_state.get("booted_for") != today.isoformat():
             st.session_state.df_boite = pd.DataFrame(savedb["df_boite"])
         st.session_state.over_boite = cleanup_legacy_overrides(savedb.get("over_boite", {}) or {})
 
-# Always re-clean in case something old is still in session (cheap insurance)
-st.session_state.over_caisse_today = cleanup_legacy_overrides(st.session_state.over_caisse_today)
-st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(st.session_state.over_caisse_yesterday)
+# Always re-clean (cheap insurance)
+for reg in (1, 2, 3):
+    st.session_state[kreg("over_caisse_today", reg)] = cleanup_legacy_overrides(st.session_state[kreg("over_caisse_today", reg)])
+    st.session_state[kreg("over_caisse_yesterday", reg)] = cleanup_legacy_overrides(st.session_state[kreg("over_caisse_yesterday", reg)])
 st.session_state.over_boite = cleanup_legacy_overrides(st.session_state.over_boite)
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
 
-h1, h2, h3, h4 = st.columns([1.1, 1.0, 1.2, 2.0])
+h1, h2, h3 = st.columns([1.1, 1.0, 2.4])
 with h1:
     st.write("**Date:**", today.isoformat())
 with h2:
     st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
 with h3:
-    st.session_state.register_no = st.selectbox(
-        "Caisse #", [1, 2, 3],
-        index=[1, 2, 3].index(int(st.session_state.register_no)),
-        key="reg_sel",
-    )
-with h4:
     st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="cashier_txt")
 
 st.session_state.target_dollars = st.number_input(
-    "Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="target_num"
+    "Cible à laisser ($)",
+    min_value=0,
+    step=10,
+    value=int(st.session_state.target_dollars),
+    key="target_num",
 )
 TARGET = int(st.session_state.target_dollars) * 100
 
 st.divider()
-tab_caisse, tab_boite, tab_save = st.tabs(["Caisse", "Boîte (Échange)", "Sauvegarde & reçus"])
 
-# ================== TAB: CAISSE ==================
-with tab_caisse:
-    st.subheader("Caisse")
+tab_c1, tab_c2, tab_c3, tab_boite, tab_save = st.tabs(
+    ["Caisse 1", "Caisse 2", "Caisse 3", "Boîte (Échange)", "Sauvegarde & reçus"]
+)
 
+# ================== CAISSE RENDER FUNCTION ==================
+def render_caisse(reg: int):
+    st.subheader(f"Caisse {reg}")
+
+    mode_key = kreg("mode_pick", reg)
+    df_today_key = kreg("df_caisse_today", reg)
+    df_yest_key = kreg("df_caisse_yesterday", reg)
+    over_today_key = kreg("over_caisse_today", reg)
+    over_yest_key = kreg("over_caisse_yesterday", reg)
+
+    # Mode selector
     mode = st.selectbox(
         "Mode",
         ["Ouverture normale", "Fermeture non effectuée (hier)"],
-        index=0 if st.session_state.mode_pick == "normal" else 1,
-        key="mode_dropdown",
+        index=0 if st.session_state[mode_key] == "normal" else 1,
+        key=f"mode_dropdown_{reg}",
     )
-    st.session_state.mode_pick = "normal" if mode == "Ouverture normale" else "missed_close"
+    st.session_state[mode_key] = "normal" if mode == "Ouverture normale" else "missed_close"
 
-    # Reset overrides button (unlock without lock UI)
+    # Reset overrides
     cA, cB = st.columns([1, 3])
     with cA:
-        if st.button("↩️ Réinitialiser les retraits", use_container_width=True):
-            st.session_state.over_caisse_today = {}
-            st.session_state.over_caisse_yesterday = {}
+        if st.button("↩️ Réinitialiser les retraits", use_container_width=True, key=f"reset_retraits_{reg}"):
+            st.session_state[over_today_key] = {}
+            st.session_state[over_yest_key] = {}
             st.rerun()
     with cB:
         st.caption(
@@ -489,18 +500,18 @@ with tab_caisse:
 
     restant_y = {k: 0 for k in DISPLAY_ORDER}
 
-    # ---- Yesterday (only if missed_close).
-    if st.session_state.mode_pick == "missed_close":
+    # ---- Yesterday (if missed close)
+    if st.session_state[mode_key] == "missed_close":
         with st.expander("Hier — fermeture non effectuée", expanded=True):
-            # Compute suggestions first (writes RETRAIT/RESTANT into the session df)
-            compute_caisse_yesterday(st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday)
-            df_y_display = st.session_state.df_caisse_yesterday.copy()
+
+            compute_caisse_yesterday(st.session_state[df_yest_key], TARGET, st.session_state[over_yest_key])
+            df_y_display = st.session_state[df_yest_key].copy()
 
             edited_y = st.data_editor(
                 df_y_display,
                 use_container_width=True,
                 hide_index=True,
-                key="editor_caisse_y",
+                key=f"editor_caisse_y_{reg}",
                 height=editor_height(len(df_y_display)),
                 column_config={
                     "Dénomination": st.column_config.TextColumn(width="large"),
@@ -511,26 +522,25 @@ with tab_caisse:
                 disabled=["Dénomination", "RESTANT"],
             )
 
-            if st.button("✅ Appliquer (hier)", use_container_width=True, key="apply_y"):
-                # 1) Commit CLOSE
-                df_store = st.session_state.df_caisse_yesterday.copy()
+            if st.button("✅ Appliquer (hier)", use_container_width=True, key=f"apply_y_{reg}"):
+                # Commit CLOSE
+                df_store = st.session_state[df_yest_key].copy()
                 for k in DISPLAY_ORDER:
                     df_store.loc[df_store["Dénomination"] == k, "CLOSE"] = safe_int(
                         edited_y.loc[edited_y["Dénomination"] == k, "CLOSE"].values[0]
                     )
-                st.session_state.df_caisse_yesterday = df_store
+                st.session_state[df_yest_key] = df_store
 
-                # 2) Update overrides ONLY for rows actually edited in RETRAIT
-                editor_state = st.session_state.get("editor_caisse_y", {})
+                # Sparse overrides from edited RETRAIT rows
+                editor_state = st.session_state.get(f"editor_caisse_y_{reg}", {})
                 edited_rows = editor_state.get("edited_rows", {}) or {}
                 idx_map = idx_to_denom_map(df_y_display)
 
-                # Suggested based on current overrides BEFORE updating
                 _, suggested_ret_y, _, _, _, _ = compute_caisse_yesterday(
-                    st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
+                    st.session_state[df_yest_key], TARGET, st.session_state[over_yest_key]
                 )
 
-                overrides = dict(st.session_state.over_caisse_yesterday)
+                overrides = dict(st.session_state[over_yest_key])
 
                 for row_idx, changes in edited_rows.items():
                     denom = idx_map.get(int(row_idx))
@@ -544,14 +554,12 @@ with tab_caisse:
                         else:
                             overrides.pop(denom, None)
 
-                st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(overrides)
-
-                compute_caisse_yesterday(st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday)
+                st.session_state[over_yest_key] = cleanup_legacy_overrides(overrides)
+                compute_caisse_yesterday(st.session_state[df_yest_key], TARGET, st.session_state[over_yest_key])
                 st.rerun()
 
-            # Status + restant_y for prefill
             close_y, retrait_y, restant_y, diff_y, leftover_y, _ = compute_caisse_yesterday(
-                st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
+                st.session_state[df_yest_key], TARGET, st.session_state[over_yest_key]
             )
 
             if diff_y <= 0:
@@ -564,27 +572,27 @@ with tab_caisse:
                 else:
                     st.warning(f"Hier: tu as retiré {cents_to_str(-leftover_y)} de trop.")
 
-        # Pre-fill OPEN today from RESTANT yesterday
-        df_t_prefill = st.session_state.df_caisse_today
+        # Pre-fill OPEN today from restant_y
+        df_t_prefill = st.session_state[df_today_key]
         for k in DISPLAY_ORDER:
             df_t_prefill.loc[df_t_prefill["Dénomination"] == k, "OPEN"] = int(restant_y.get(k, 0))
-        st.session_state.df_caisse_today = df_t_prefill
+        st.session_state[df_today_key] = df_t_prefill
 
     st.markdown("### Aujourd'hui")
 
-    # Compute suggestions first so editor shows them
-    compute_caisse_today(st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today)
-    df_t_display = st.session_state.df_caisse_today.copy()
+    # Compute suggestions and show in editor
+    compute_caisse_today(st.session_state[df_today_key], TARGET, st.session_state[over_today_key])
+    df_t_display = st.session_state[df_today_key].copy()
 
     disabled_cols = ["Dénomination", "RESTANT"]
-    if st.session_state.mode_pick != "normal":
+    if st.session_state[mode_key] != "normal":
         disabled_cols.append("OPEN")
 
     edited_t = st.data_editor(
         df_t_display,
         use_container_width=True,
         hide_index=True,
-        key="editor_caisse_t",
+        key=f"editor_caisse_t_{reg}",
         height=editor_height(len(df_t_display)),
         column_config={
             "Dénomination": st.column_config.TextColumn(width="large"),
@@ -596,9 +604,9 @@ with tab_caisse:
         disabled=disabled_cols,
     )
 
-    if st.button("✅ Appliquer (aujourd'hui)", use_container_width=True, key="apply_t"):
-        # 1) Commit OPEN/CLOSE (don’t blindly commit RETRAIT)
-        df_store = st.session_state.df_caisse_today.copy()
+    if st.button("✅ Appliquer (aujourd'hui)", use_container_width=True, key=f"apply_t_{reg}"):
+        # Commit OPEN/CLOSE
+        df_store = st.session_state[df_today_key].copy()
         for k in DISPLAY_ORDER:
             if "OPEN" not in disabled_cols:
                 df_store.loc[df_store["Dénomination"] == k, "OPEN"] = safe_int(
@@ -607,19 +615,18 @@ with tab_caisse:
             df_store.loc[df_store["Dénomination"] == k, "CLOSE"] = safe_int(
                 edited_t.loc[edited_t["Dénomination"] == k, "CLOSE"].values[0]
             )
-        st.session_state.df_caisse_today = df_store
+        st.session_state[df_today_key] = df_store
 
-        # 2) Overrides only where user actually edited RETRAIT
-        editor_state = st.session_state.get("editor_caisse_t", {})
+        # Sparse overrides from edited RETRAIT rows
+        editor_state = st.session_state.get(f"editor_caisse_t_{reg}", {})
         edited_rows = editor_state.get("edited_rows", {}) or {}
         idx_map = idx_to_denom_map(df_t_display)
 
-        # Suggested before updating overrides
         _, _, suggested_ret, _, _, _, _ = compute_caisse_today(
-            st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
+            st.session_state[df_today_key], TARGET, st.session_state[over_today_key]
         )
 
-        overrides = dict(st.session_state.over_caisse_today)
+        overrides = dict(st.session_state[over_today_key])
 
         for row_idx, changes in edited_rows.items():
             denom = idx_map.get(int(row_idx))
@@ -633,22 +640,20 @@ with tab_caisse:
                 else:
                     overrides.pop(denom, None)
 
-        st.session_state.over_caisse_today = cleanup_legacy_overrides(overrides)
+        st.session_state[over_today_key] = cleanup_legacy_overrides(overrides)
 
-        # 3) Final compute writes RETRAIT/RESTANT + totals
-        compute_caisse_today(st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today)
+        compute_caisse_today(st.session_state[df_today_key], TARGET, st.session_state[over_today_key])
         st.rerun()
 
-    # Recompute for status + receipt
+    # Status + receipt data
     open_t, close_t, retrait_t, restant_t, diff_t, leftover_t, _ = compute_caisse_today(
-        st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
+        st.session_state[df_today_key], TARGET, st.session_state[over_today_key]
     )
 
-    # Debug line (helps instantly if you think “it’s not suggesting”)
     st.caption(
-        f"DEBUG — CLOSE total: {total_cents_from_counts(close_t)/100:.2f}$ | "
+        f"DEBUG — Caisse {reg} | CLOSE total: {total_cents_from_counts(close_t)/100:.2f}$ | "
         f"Target: {TARGET/100:.2f}$ | Diff: {diff_t/100:.2f}$ | "
-        f"Overrides: {len(st.session_state.over_caisse_today)}"
+        f"Overrides: {len(st.session_state[over_today_key])}"
     )
 
     if diff_t <= 0:
@@ -661,15 +666,15 @@ with tab_caisse:
         else:
             st.warning(f"Tu as retiré {cents_to_str(-leftover_t)} de trop.")
 
-    # Receipt + save
+    # Save + receipt
     meta_caisse = {
-        "Type": "CAISSE",
+        "Type": f"CAISSE {reg}",
         "Date": today.isoformat(),
         "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        "Caisse #": int(st.session_state.register_no),
+        "Caisse #": reg,
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Cible $": int(st.session_state.target_dollars),
-        "Mode": "Fermeture non effectuée (hier)" if st.session_state.mode_pick == "missed_close" else "Ouverture normale",
+        "Mode": "Fermeture non effectuée (hier)" if st.session_state[mode_key] == "missed_close" else "Ouverture normale",
     }
 
     rows_today = []
@@ -691,24 +696,35 @@ with tab_caisse:
 
     payload_caisse = {
         "meta": meta_caisse,
-        "mode_pick": st.session_state.mode_pick,
-        "df_caisse_today": st.session_state.df_caisse_today.to_dict(orient="records"),
-        "df_caisse_yesterday": st.session_state.df_caisse_yesterday.to_dict(orient="records"),
-        "over_caisse_today": st.session_state.over_caisse_today,
-        "over_caisse_yesterday": st.session_state.over_caisse_yesterday,
+        "mode_pick": st.session_state[mode_key],
+        "df_caisse_today": st.session_state[df_today_key].to_dict(orient="records"),
+        "df_caisse_yesterday": st.session_state[df_yest_key].to_dict(orient="records"),
+        "over_caisse_today": st.session_state[over_today_key],
+        "over_caisse_yesterday": st.session_state[over_yest_key],
         "rows_today": rows_today,
     }
 
-    state_path, receipt_path = caisse_paths(today)
+    state_path, receipt_path = caisse_paths(today, reg)
+    hash_key = f"last_hash_caisse_{reg}"
     hc = hash_payload(payload_caisse)
-    if st.session_state.last_hash_caisse != hc:
+    if st.session_state.get(hash_key) != hc:
         html = receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_today)
         save_json(state_path, payload_caisse)
         save_text(receipt_path, html)
-        st.session_state.last_hash_caisse = hc
+        st.session_state[hash_key] = hc
 
     with st.expander("Aperçu reçu — Caisse", expanded=False):
         components.html(load_text(receipt_path) or html, height=560, scrolling=True)
+
+# ================== TAB: CAISSES 1..3 ==================
+with tab_c1:
+    render_caisse(1)
+
+with tab_c2:
+    render_caisse(2)
+
+with tab_c3:
+    render_caisse(3)
 
 # ================== TAB: BOÎTE ==================
 with tab_boite:
@@ -716,7 +732,7 @@ with tab_boite:
 
     cA, cB = st.columns([1, 3])
     with cA:
-        if st.button("↩️ Réinitialiser change", use_container_width=True):
+        if st.button("↩️ Réinitialiser change", use_container_width=True, key="reset_change"):
             st.session_state.over_boite = {}
             st.rerun()
     with cB:
@@ -746,7 +762,7 @@ with tab_boite:
     )
 
     if st.button("✅ Appliquer (boîte)", use_container_width=True, key="apply_b"):
-        # 1) Commit OPEN + AJOUTÉ
+        # Commit OPEN + AJOUTÉ
         df_store = st.session_state.df_boite.copy()
         for k in DISPLAY_ORDER:
             df_store.loc[df_store["Dénomination"] == k, "OPEN"] = safe_int(
@@ -757,12 +773,11 @@ with tab_boite:
             )
         st.session_state.df_boite = df_store
 
-        # 2) Overrides only for rows actually edited in RETRAIT (en change)
+        # Sparse overrides from edited RETRAIT (en change)
         editor_state = st.session_state.get("editor_boite", {})
         edited_rows = editor_state.get("edited_rows", {}) or {}
         idx_map = idx_to_denom_map(df_b_display)
 
-        # Suggested before updating overrides
         _, _, suggested_ret_b, _, _, _, _ = compute_boite(st.session_state.df_boite, st.session_state.over_boite)
 
         overrides = dict(st.session_state.over_boite)
@@ -784,7 +799,6 @@ with tab_boite:
         compute_boite(st.session_state.df_boite, st.session_state.over_boite)
         st.rerun()
 
-    # Recompute for status + receipt
     open_b, add_b, ret_b, res_b, total_add, leftover_b, _ = compute_boite(
         st.session_state.df_boite, st.session_state.over_boite
     )
@@ -804,7 +818,6 @@ with tab_boite:
         "Date": today.isoformat(),
         "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
-        "Caisse #": int(st.session_state.register_no),
         "Ajouté total ($)": f"{total_add/100:.2f}",
     }
 
@@ -859,36 +872,42 @@ with tab_save:
     colA, colB = st.columns(2)
 
     with colA:
-        st.markdown("## 📒 Caisse")
+        st.markdown("## 📒 Caisses (1–3)")
         dates = list_dates(DIR_CAISSE)
         if not dates:
             st.info("Aucun enregistrement Caisse.")
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
-                state_path, receipt_path = caisse_paths(d)
-                with st.expander(f"{ds} — Reçu Caisse", expanded=False):
-                    html = load_text(receipt_path)
-                    if html:
-                        components.html(html, height=650, scrolling=True)
-                    if os.path.exists(receipt_path):
-                        with open(receipt_path, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger reçu (HTML)",
-                                f.read(),
-                                os.path.basename(receipt_path),
-                                "text/html",
-                                key=f"dl_c_html_{ds}",
-                            )
-                    if os.path.exists(state_path):
-                        with open(state_path, "rb") as f:
-                            st.download_button(
-                                "⬇️ Télécharger état (JSON)",
-                                f.read(),
-                                os.path.basename(state_path),
-                                "application/json",
-                                key=f"dl_c_json_{ds}",
-                            )
+
+                for reg in (1, 2, 3):
+                    state_path, receipt_path = caisse_paths(d, reg)
+                    if not os.path.exists(state_path) and not os.path.exists(receipt_path):
+                        continue
+
+                    with st.expander(f"{ds} — Caisse {reg}", expanded=False):
+                        html = load_text(receipt_path)
+                        if html:
+                            components.html(html, height=650, scrolling=True)
+
+                        if os.path.exists(receipt_path):
+                            with open(receipt_path, "rb") as f:
+                                st.download_button(
+                                    "⬇️ Télécharger reçu (HTML)",
+                                    f.read(),
+                                    os.path.basename(receipt_path),
+                                    "text/html",
+                                    key=f"dl_c_html_{ds}_{reg}",
+                                )
+                        if os.path.exists(state_path):
+                            with open(state_path, "rb") as f:
+                                st.download_button(
+                                    "⬇️ Télécharger état (JSON)",
+                                    f.read(),
+                                    os.path.basename(state_path),
+                                    "application/json",
+                                    key=f"dl_c_json_{ds}_{reg}",
+                                )
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
