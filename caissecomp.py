@@ -1,7 +1,6 @@
 # caisse200plus.py
 # Registre — Caisse & Boîte (Échange)
-# Report-style compact tables using st.data_editor
-# FIX: Stop "revert to 0" by batching edits inside st.form (commit only on submit)
+# Compact "report-like" tables + no revert-to-0 + smart retrait steering + unlock UI
 
 import os
 import json
@@ -30,26 +29,17 @@ st.markdown(
     """
 <style>
 .main .block-container { padding-top: 0.55rem !important; padding-bottom: 0.75rem !important; max-width: 1650px !important; }
-h1,h2,h3 { margin-bottom: 0.15rem !important; }
-div[data-testid="stVerticalBlock"] { gap: 0.22rem !important; }
+h1,h2,h3 { margin-bottom: 0.2rem !important; }
+div[data-testid="stVerticalBlock"] { gap: 0.18rem !important; }
 
-/* Make tables look like a printed report (white, compact, continuous lines) */
+/* Report look (white, condensed) */
 div[data-testid="stDataFrame"] { border: 2px solid #222 !important; border-radius: 0 !important; background:#fff !important; }
 div[data-testid="stDataFrame"] * { font-size: 13px !important; }
-div[data-testid="stDataFrame"] th { font-weight: 900 !important; background: #f2f2f2 !important; }
-div[data-testid="stDataFrame"] td { font-weight: 800 !important; background:#fff !important; }
-div[data-testid="stDataFrame"] input {
-  font-weight: 900 !important;
-  text-align: center !important;
-}
+div[data-testid="stDataFrame"] thead th { font-weight: 950 !important; background: #f2f2f2 !important; }
+div[data-testid="stDataFrame"] tbody td { font-weight: 800 !important; background:#fff !important; }
+div[data-testid="stDataFrame"] td, div[data-testid="stDataFrame"] th { padding-top: 6px !important; padding-bottom: 6px !important; }
+div[data-testid="stDataFrame"] input { font-weight: 950 !important; text-align: center !important; }
 
-/* Reduce inner padding so you scroll less */
-div[data-testid="stDataFrame"] td, div[data-testid="stDataFrame"] th {
-  padding-top: 6px !important;
-  padding-bottom: 6px !important;
-}
-
-/* Make form buttons not huge */
 button[kind="primary"], button[kind="secondary"] { font-weight: 900 !important; }
 </style>
 """,
@@ -88,33 +78,21 @@ ROLLS = [
 ]
 DISPLAY_ORDER = BILLS_BIG + BILLS_SMALL + COINS + ROLLS
 
+COINS_DESC = sorted(COINS, key=lambda x: DENOMS[x], reverse=True)
+ROLLS_DESC = sorted(ROLLS, key=lambda x: DENOMS[x], reverse=True)
+
+PRIORITY_CAISSE = BILLS_BIG + BILLS_SMALL + COINS_DESC + ROLLS_DESC
+PRIORITY_BOITE = (
+    ["Billet 20 $", "Billet 10 $", "Billet 5 $"]
+    + ["Pièce 2 $", "Pièce 1 $", "Pièce 0,25 $", "Pièce 0,10 $", "Pièce 0,05 $"]
+    + ROLLS
+    + ["Billet 50 $", "Billet 100 $"]
+)
+
 
 # ================== HELPERS ==================
 def cents_to_str(c: int) -> str:
     return f"{c/100:.2f} $"
-
-def init_df(cols: list[str]) -> pd.DataFrame:
-    df = pd.DataFrame({"Dénomination": DISPLAY_ORDER})
-    for c in cols:
-        df[c] = 0
-    return df
-
-def total_cents_counts(counts: dict) -> int:
-    return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
-
-def counts_from_df(df: pd.DataFrame, col: str) -> dict:
-    out = {k: 0 for k in DISPLAY_ORDER}
-    if not isinstance(df, pd.DataFrame) or col not in df.columns:
-        return out
-    for _, r in df.iterrows():
-        denom = r.get("Dénomination")
-        if denom in out:
-            try:
-                v = int(r.get(col, 0))
-            except Exception:
-                v = 0
-            out[denom] = max(0, v)
-    return out
 
 def clean_int(x, default=0) -> int:
     if x is None:
@@ -130,18 +108,38 @@ def clean_int(x, default=0) -> int:
         return default
     return max(0, v)
 
+def init_df(cols: list[str]) -> pd.DataFrame:
+    df = pd.DataFrame({"Dénomination": DISPLAY_ORDER})
+    for c in cols:
+        df[c] = 0
+    return df
+
+def counts_from_df(df: pd.DataFrame, col: str) -> dict:
+    out = {k: 0 for k in DISPLAY_ORDER}
+    if not isinstance(df, pd.DataFrame) or col not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        denom = r.get("Dénomination")
+        if denom in out:
+            out[denom] = clean_int(r.get(col, 0), 0)
+    return out
+
+def total_cents_counts(counts: dict) -> int:
+    return sum(int(counts.get(k, 0)) * DENOMS[k] for k in DENOMS)
+
+def sub_counts(a: dict, b: dict) -> dict:
+    return {k: int(a.get(k, 0)) - int(b.get(k, 0)) for k in DENOMS}
+
+def add_counts(a: dict, b: dict) -> dict:
+    return {k: int(a.get(k, 0)) + int(b.get(k, 0)) for k in DENOMS}
+
 def merge_commit(base: pd.DataFrame, edited: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """
-    Commit edits ONLY when form is submitted.
-    Here we can safely coerce blanks to 0 because user finished editing.
-    """
+    """Commit edited values into base for specific cols (by denom)."""
     out = base.copy()
     if not isinstance(edited, pd.DataFrame) or "Dénomination" not in edited.columns:
         return out
-
     out = out.set_index("Dénomination")
     e = edited.set_index("Dénomination")
-
     for c in cols:
         if c not in out.columns:
             out[c] = 0
@@ -151,6 +149,82 @@ def merge_commit(base: pd.DataFrame, edited: pd.DataFrame, cols: list[str]) -> p
             if denom in e.index:
                 out.at[denom, c] = clean_int(e.at[denom, c], default=int(out.at[denom, c]))
     return out.reset_index()
+
+def get_locks(lock_key: str) -> dict:
+    if lock_key not in st.session_state:
+        st.session_state[lock_key] = {}
+    # ensure ints
+    d = {}
+    for k, v in dict(st.session_state[lock_key]).items():
+        if k in DENOMS:
+            d[k] = clean_int(v, 0)
+    st.session_state[lock_key] = d
+    return dict(d)
+
+def set_locks(lock_key: str, d: dict):
+    dd = {}
+    for k, v in (d or {}).items():
+        if k in DENOMS:
+            dd[k] = clean_int(v, 0)
+    st.session_state[lock_key] = dd
+
+def render_unlock_ui(lock_key: str, title: str):
+    locks = get_locks(lock_key)
+    with st.expander(title, expanded=False):
+        if not locks:
+            st.info("Aucun verrou actif.")
+            return
+        c0, c1 = st.columns([1, 2])
+        with c0:
+            if st.button("Tout déverrouiller", key=f"{lock_key}_unlock_all"):
+                set_locks(lock_key, {})
+                st.rerun()
+        st.markdown("**Verrous actifs (RETRAIT) :**")
+        for denom in list(locks.keys()):
+            a, b, c = st.columns([3.2, 1.2, 1.4])
+            a.write(denom)
+            b.write(f"**{int(locks[denom])}**")
+            if c.button("Déverrouiller", key=f"{lock_key}_unlock_{denom}"):
+                new = get_locks(lock_key)
+                new.pop(denom, None)
+                set_locks(lock_key, new)
+                st.rerun()
+
+def take_greedy(remaining: int, keys_order: list, avail: dict, out: dict, locked: dict) -> int:
+    for k in keys_order:
+        if remaining <= 0:
+            break
+        # if locked (even 0), we do not auto-use it
+        if k in locked:
+            continue
+        v = DENOMS[k]
+        can_take = int(avail.get(k, 0)) - int(out.get(k, 0))
+        if can_take < 0:
+            can_take = 0
+        take = min(remaining // v, can_take)
+        if take > 0:
+            out[k] = int(out.get(k, 0)) + int(take)
+            remaining -= int(take) * v
+    return remaining
+
+def suggest_with_locks(amount_cents: int, avail: dict, priority: list, locks: dict):
+    """
+    Build suggestion that sums to amount_cents using avail counts and greedy priority,
+    respecting locks:
+    - locks[k] = fixed qty (including 0 => "ban denom").
+    """
+    out = {k: 0 for k in DENOMS}
+    # apply locks first
+    for k, q in (locks or {}).items():
+        out[k] = clean_int(q, 0)
+
+    remaining = amount_cents - total_cents_counts(out)
+    if remaining < 0:
+        # locks already exceed target; still return out
+        return out, remaining
+
+    remaining = take_greedy(remaining, priority, avail, out, locks or {})
+    return out, remaining
 
 def hash_payload(obj: dict) -> str:
     raw = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -207,7 +281,6 @@ def receipt_html(title: str, meta: dict, headers: list, rows: list) -> str:
             else:
                 tds.append(f"<td style='text-align:center'><b>{val}</b></td>")
         body += "<tr>" + "".join(tds) + "</tr>"
-
     return f"""
     <html><head><meta charset="utf-8"/><title>{title}</title>
     <style>
@@ -255,8 +328,6 @@ if not st.session_state.auth:
 today = datetime.now(TZ).date()
 yesterday = today - timedelta(days=1)
 
-if "mode_pick" not in st.session_state:
-    st.session_state.mode_pick = "normal"
 if "cashier" not in st.session_state:
     st.session_state.cashier = ""
 if "register_no" not in st.session_state:
@@ -264,25 +335,47 @@ if "register_no" not in st.session_state:
 if "target_dollars" not in st.session_state:
     st.session_state.target_dollars = 200
 
+# mode dropdown state
+if "mode_pick" not in st.session_state:
+    st.session_state.mode_pick = "normal"  # "normal" or "missed_close"
+
+# editor base tables (committed)
+if "df_caisse_today" not in st.session_state:
+    st.session_state.df_caisse_today = init_df(["OPEN", "CLOSE", "RETRAIT", "RESTANT"])
+if "df_caisse_yesterday" not in st.session_state:
+    st.session_state.df_caisse_yesterday = init_df(["CLOSE", "RETRAIT", "RESTANT"])
+if "df_boite" not in st.session_state:
+    st.session_state.df_boite = init_df(["OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"])
+
+# locks
+LOCK_T = "locks_retrait_caisse_today"
+LOCK_Y = "locks_retrait_caisse_yesterday"
+LOCK_B = "locks_retrait_boite"
+
+# last committed RETRAIT snapshots for detecting what user changed
+if "last_retrait_t" not in st.session_state:
+    st.session_state.last_retrait_t = {k: 0 for k in DISPLAY_ORDER}
+if "last_retrait_y" not in st.session_state:
+    st.session_state.last_retrait_y = {k: 0 for k in DISPLAY_ORDER}
+if "last_retrait_b" not in st.session_state:
+    st.session_state.last_retrait_b = {k: 0 for k in DISPLAY_ORDER}
+
+# autosave hashes
 if "last_hash_caisse" not in st.session_state:
     st.session_state.last_hash_caisse = None
 if "last_hash_boite" not in st.session_state:
     st.session_state.last_hash_boite = None
 
-# Base DF states
-if "base_caisse_today" not in st.session_state:
-    st.session_state.base_caisse_today = init_df(["OPEN", "CLOSE", "RETRAIT"])
-if "base_caisse_yesterday" not in st.session_state:
-    st.session_state.base_caisse_yesterday = init_df(["CLOSE", "RETRAIT"])
-if "base_boite" not in st.session_state:
-    st.session_state.base_boite = init_df(["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
+# boot-load saved state daily
+if "booted_for" not in st.session_state:
+    st.session_state.booted_for = None
 
-# Load saved once per day
-if "booted_for" not in st.session_state or st.session_state.booted_for != today.isoformat():
+if st.session_state.booted_for != today.isoformat():
     st.session_state.booted_for = today.isoformat()
 
-    sp, _ = caisse_paths(today)
-    saved = load_json(sp)
+    # load caisse state
+    state_path_c, _ = caisse_paths(today)
+    saved = load_json(state_path_c)
     if saved:
         meta = saved.get("meta", {})
         st.session_state.cashier = meta.get("Caissier(ère)", st.session_state.cashier)
@@ -290,37 +383,22 @@ if "booted_for" not in st.session_state or st.session_state.booted_for != today.
         st.session_state.target_dollars = int(meta.get("Cible $", st.session_state.target_dollars))
         st.session_state.mode_pick = saved.get("mode_pick", st.session_state.mode_pick)
 
-        counts = saved.get("counts", {})
-        open_t = counts.get("caisse_open_today", {})
-        close_t = counts.get("caisse_close_today", {})
-        retrait_t = saved.get("locked_retrait_caisse", {}) or {}
+        st.session_state.df_caisse_today = pd.DataFrame(saved.get("df_caisse_today", st.session_state.df_caisse_today))
+        st.session_state.df_caisse_yesterday = pd.DataFrame(saved.get("df_caisse_yesterday", st.session_state.df_caisse_yesterday))
 
-        df = init_df(["OPEN", "CLOSE", "RETRAIT"])
-        df["OPEN"] = [clean_int(open_t.get(k, 0)) for k in DISPLAY_ORDER]
-        df["CLOSE"] = [clean_int(close_t.get(k, 0)) for k in DISPLAY_ORDER]
-        df["RETRAIT"] = [clean_int(retrait_t.get(k, 0)) for k in DISPLAY_ORDER]
-        st.session_state.base_caisse_today = df
+        set_locks(LOCK_T, saved.get("locks_today", {}))
+        set_locks(LOCK_Y, saved.get("locks_yesterday", {}))
 
-        close_y = counts.get("caisse_close_yesterday", {})
-        retrait_y = saved.get("locked_retrait_hier", {}) or {}
-        dfy = init_df(["CLOSE", "RETRAIT"])
-        dfy["CLOSE"] = [clean_int(close_y.get(k, 0)) for k in DISPLAY_ORDER]
-        dfy["RETRAIT"] = [clean_int(retrait_y.get(k, 0)) for k in DISPLAY_ORDER]
-        st.session_state.base_caisse_yesterday = dfy
+        st.session_state.last_retrait_t = saved.get("last_retrait_t", st.session_state.last_retrait_t)
+        st.session_state.last_retrait_y = saved.get("last_retrait_y", st.session_state.last_retrait_y)
 
-    spb, _ = boite_paths(today)
-    savedb = load_json(spb)
+    # load boite state
+    state_path_b, _ = boite_paths(today)
+    savedb = load_json(state_path_b)
     if savedb:
-        counts = savedb.get("counts", {})
-        open_b = counts.get("boite_open", {})
-        add_b = counts.get("boite_added", {})
-        ret_b = savedb.get("locked_withdraw_boite", {}) or {}
-
-        dfb = init_df(["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
-        dfb["OPEN"] = [clean_int(open_b.get(k, 0)) for k in DISPLAY_ORDER]
-        dfb["AJOUTÉ"] = [clean_int(add_b.get(k, 0)) for k in DISPLAY_ORDER]
-        dfb["RETRAIT (en change)"] = [clean_int(ret_b.get(k, 0)) for k in DISPLAY_ORDER]
-        st.session_state.base_boite = dfb
+        st.session_state.df_boite = pd.DataFrame(savedb.get("df_boite", st.session_state.df_boite))
+        set_locks(LOCK_B, savedb.get("locks_boite", {}))
+        st.session_state.last_retrait_b = savedb.get("last_retrait_b", st.session_state.last_retrait_b)
 
 
 # ================== HEADER ==================
@@ -332,238 +410,346 @@ with h1:
 with h2:
     st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
 with h3:
-    st.session_state.register_no = st.selectbox(
-        "Caisse #", [1, 2, 3], index=[1, 2, 3].index(int(st.session_state.register_no)), key="reg_sel"
-    )
+    st.session_state.register_no = st.selectbox("Caisse #", [1, 2, 3], index=[1, 2, 3].index(int(st.session_state.register_no)), key="reg_sel")
 with h4:
     st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="cashier_txt")
 
-st.session_state.target_dollars = st.number_input(
-    "Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="target_num"
-)
+st.session_state.target_dollars = st.number_input("Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="target_num")
 
-tab_caisse, tab_boite, tab_save = st.tabs(["1) Caisse", "2) Boîte (Échange)", "3) Sauvegarde & reçus"])
+st.divider()
+
+tab_caisse, tab_boite, tab_save = st.tabs(["Caisse", "Boîte (Échange)", "Sauvegarde & reçus"])
+
+
+# ================== CAISSE COMPUTE REFRESH ==================
+def refresh_caisse_tables():
+    TARGET = int(st.session_state.target_dollars) * 100
+
+    # yesterday table only used if missed close
+    dfy = st.session_state.df_caisse_yesterday.copy()
+    # ensure columns exist
+    for c in ["Dénomination", "CLOSE", "RETRAIT", "RESTANT"]:
+        if c not in dfy.columns:
+            if c == "Dénomination":
+                dfy[c] = DISPLAY_ORDER
+            else:
+                dfy[c] = 0
+    dfy = dfy[["Dénomination", "CLOSE", "RETRAIT", "RESTANT"]]
+
+    close_y = counts_from_df(dfy, "CLOSE")
+    total_close_y = total_cents_counts(close_y)
+    diff_y = total_close_y - TARGET
+
+    locks_y = get_locks(LOCK_Y)
+    retrait_y = {k: 0 for k in DISPLAY_ORDER}
+    restant_y = dict(close_y)
+    remaining_y = 0
+
+    if diff_y > 0:
+        retrait_y, remaining_y = suggest_with_locks(diff_y, close_y, PRIORITY_CAISSE, locks_y)
+        restant_y = sub_counts(close_y, retrait_y)
+
+    # write computed columns back
+    for i, denom in enumerate(DISPLAY_ORDER):
+        dfy.loc[dfy["Dénomination"] == denom, "RETRAIT"] = int(retrait_y.get(denom, 0))
+        dfy.loc[dfy["Dénomination"] == denom, "RESTANT"] = int(restant_y.get(denom, 0))
+    st.session_state.df_caisse_yesterday = dfy
+
+    # today table
+    dft = st.session_state.df_caisse_today.copy()
+    for c in ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]:
+        if c not in dft.columns:
+            if c == "Dénomination":
+                dft[c] = DISPLAY_ORDER
+            else:
+                dft[c] = 0
+    dft = dft[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]]
+
+    # if missed_close, OPEN today must be restant_y
+    if st.session_state.mode_pick == "missed_close":
+        for denom in DISPLAY_ORDER:
+            dft.loc[dft["Dénomination"] == denom, "OPEN"] = int(restant_y.get(denom, 0))
+
+    open_t = counts_from_df(dft, "OPEN")
+    close_t = counts_from_df(dft, "CLOSE")
+
+    total_close_t = total_cents_counts(close_t)
+    diff_t = total_close_t - TARGET
+
+    locks_t = get_locks(LOCK_T)
+    retrait_t = {k: 0 for k in DISPLAY_ORDER}
+    restant_t = dict(close_t)
+    remaining_t = 0
+
+    if diff_t > 0:
+        retrait_t, remaining_t = suggest_with_locks(diff_t, close_t, PRIORITY_CAISSE, locks_t)
+        restant_t = sub_counts(close_t, retrait_t)
+
+    for denom in DISPLAY_ORDER:
+        dft.loc[dft["Dénomination"] == denom, "RETRAIT"] = int(retrait_t.get(denom, 0))
+        dft.loc[dft["Dénomination"] == denom, "RESTANT"] = int(restant_t.get(denom, 0))
+    st.session_state.df_caisse_today = dft
+
+    return {
+        "TARGET": TARGET,
+        "diff_y": diff_y,
+        "remaining_y": remaining_y,
+        "close_y": close_y,
+        "retrait_y": retrait_y,
+        "restant_y": restant_y,
+        "diff_t": diff_t,
+        "remaining_t": remaining_t,
+        "open_t": open_t,
+        "close_t": close_t,
+        "retrait_t": retrait_t,
+        "restant_t": restant_t,
+    }
 
 
 # ================== TAB: CAISSE ==================
 with tab_caisse:
-    mode_labels = {"normal": "Ouverture normale", "missed_close": "Fermeture non effectuée (hier)"}
+    st.subheader("Caisse")
 
-    picked = st.selectbox(
+    st.session_state.mode_pick = st.selectbox(
         "Mode",
-        options=["normal", "missed_close"],
-        format_func=lambda x: mode_labels[x],
+        ["Ouverture normale", "Fermeture non effectuée (hier)"],
         index=0 if st.session_state.mode_pick == "normal" else 1,
-        key="mode_pick_sel",
+        key="mode_dropdown",
     )
-    st.session_state.mode_pick = picked
+    st.session_state.mode_pick = "normal" if st.session_state.mode_pick.startswith("Ouverture") else "missed_close"
 
-    TARGET = int(st.session_state.target_dollars) * 100
-    restant_y = {k: 0 for k in DISPLAY_ORDER}
+    # recompute computed columns
+    ctx = refresh_caisse_tables()
 
-    # ---- Hier
     if st.session_state.mode_pick == "missed_close":
-        st.subheader("Hier — fermeture non effectuée")
+        st.markdown("### Hier — fermeture non effectuée")
+        st.caption("Entre le CLOSE d'hier. Ajuste RETRAIT en modifiant la colonne RETRAIT (mettre 0 = bannir une coupure).")
 
-        base_y = st.session_state.base_caisse_yesterday.copy()
+        with st.form("form_caisse_y", clear_on_submit=False):
+            dfy_display = st.session_state.df_caisse_yesterday.copy()
 
-        close_y = counts_from_df(base_y, "CLOSE")
-        retrait_y = counts_from_df(base_y, "RETRAIT")
-        for k in DISPLAY_ORDER:
-            if retrait_y[k] > close_y[k]:
-                retrait_y[k] = close_y[k]
-        restant_y = {k: max(0, close_y[k] - retrait_y[k]) for k in DISPLAY_ORDER}
-
-        dfy = base_y.copy()
-        dfy["RESTANT"] = [restant_y[k] for k in DISPLAY_ORDER]
-
-        with st.form("form_caisse_yesterday", clear_on_submit=False):
             edited_y = st.data_editor(
-                dfy[["Dénomination", "CLOSE", "RETRAIT", "RESTANT"]],
+                dfy_display,
                 use_container_width=True,
                 hide_index=True,
-                num_rows="fixed",
-                height=520,
+                key="editor_caisse_y",
                 column_config={
                     "Dénomination": st.column_config.TextColumn(disabled=True),
                     "CLOSE": st.column_config.NumberColumn(min_value=0, step=1),
                     "RETRAIT": st.column_config.NumberColumn(min_value=0, step=1),
                     "RESTANT": st.column_config.NumberColumn(disabled=True),
                 },
-                key="editor_caisse_y",
             )
-            apply_y = st.form_submit_button("✅ Appliquer (hier)")
 
-        if apply_y:
-            st.session_state.base_caisse_yesterday = merge_commit(
-                st.session_state.base_caisse_yesterday, edited_y, ["CLOSE", "RETRAIT"]
-            )
+            submitted_y = st.form_submit_button("✅ Appliquer (hier)")
+
+        if submitted_y:
+            base = st.session_state.df_caisse_yesterday.copy()
+            committed = merge_commit(base, edited_y, ["CLOSE", "RETRAIT"])  # user may edit RETRAIT to lock/ban
+
+            # detect changed RETRAIT -> update locks only for those denoms
+            new_retrait = counts_from_df(committed, "RETRAIT")
+            last = dict(st.session_state.last_retrait_y)
+            locks = get_locks(LOCK_Y)
+            for denom in DISPLAY_ORDER:
+                if int(new_retrait.get(denom, 0)) != int(last.get(denom, 0)):
+                    locks[denom] = int(new_retrait.get(denom, 0))
+            set_locks(LOCK_Y, locks)
+            st.session_state.last_retrait_y = new_retrait
+
+            st.session_state.df_caisse_yesterday = committed
+            # refresh computed and OPEN today
+            refresh_caisse_tables()
             st.rerun()
 
-        # Totals (hier)
-        close_y = counts_from_df(st.session_state.base_caisse_yesterday, "CLOSE")
-        retrait_y = counts_from_df(st.session_state.base_caisse_yesterday, "RETRAIT")
-        for k in DISPLAY_ORDER:
-            if retrait_y[k] > close_y[k]:
-                retrait_y[k] = close_y[k]
-        restant_y = {k: max(0, close_y[k] - retrait_y[k]) for k in DISPLAY_ORDER}
+        # totals row under yesterday
+        total_close_y = total_cents_counts(ctx["close_y"])
+        total_retrait_y = total_cents_counts(ctx["retrait_y"])
+        total_restant_y = total_cents_counts(ctx["restant_y"])
 
-        st.caption(
-            f"TOTAL CLOSE (hier): {cents_to_str(total_cents_counts(close_y))} | "
-            f"TOTAL RETRAIT (hier): {cents_to_str(total_cents_counts(retrait_y))} | "
-            f"TOTAL RESTANT (hier): {cents_to_str(total_cents_counts(restant_y))}"
-        )
+        total_row_y = pd.DataFrame([{
+            "Dénomination": "TOTAL ($)",
+            "CLOSE": float(f"{total_close_y/100:.2f}"),
+            "RETRAIT": float(f"{total_retrait_y/100:.2f}"),
+            "RESTANT": float(f"{total_restant_y/100:.2f}"),
+        }])
+
+        st.dataframe(total_row_y, use_container_width=True, hide_index=True)
+
+        render_unlock_ui(LOCK_Y, "Déverrouiller des coupures (RETRAIT) — HIER")
+
         st.divider()
 
-    # ---- Aujourd'hui
-    st.subheader("Aujourd'hui")
+    st.markdown("### Aujourd'hui")
+    st.caption("Entre OPEN/CLOSE. Pour forcer une autre combinaison, modifie RETRAIT (mettre 0 = bannir une coupure).")
 
-    base_t = st.session_state.base_caisse_today.copy()
+    with st.form("form_caisse_t", clear_on_submit=False):
+        dft_display = st.session_state.df_caisse_today.copy()
 
-    # Force OPEN today from yesterday RESTANT if missed close
-    if st.session_state.mode_pick == "missed_close":
-        base_t["OPEN"] = [clean_int(restant_y.get(k, 0)) for k in DISPLAY_ORDER]
-
-    open_t = counts_from_df(base_t, "OPEN")
-    close_t = counts_from_df(base_t, "CLOSE")
-    retrait_t = counts_from_df(base_t, "RETRAIT")
-    for k in DISPLAY_ORDER:
-        if retrait_t[k] > close_t[k]:
-            retrait_t[k] = close_t[k]
-    restant_t = {k: max(0, close_t[k] - retrait_t[k]) for k in DISPLAY_ORDER}
-
-    dft = base_t.copy()
-    dft["RETRAIT"] = [retrait_t[k] for k in DISPLAY_ORDER]
-    dft["RESTANT"] = [restant_t[k] for k in DISPLAY_ORDER]
-
-    open_disabled = (st.session_state.mode_pick != "normal")
-
-    with st.form("form_caisse_today", clear_on_submit=False):
         edited_t = st.data_editor(
-            dft[["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"]],
+            dft_display,
             use_container_width=True,
             hide_index=True,
-            num_rows="fixed",
-            height=520,
+            key="editor_caisse_t",
             column_config={
                 "Dénomination": st.column_config.TextColumn(disabled=True),
-                "OPEN": st.column_config.NumberColumn(min_value=0, step=1, disabled=open_disabled),
+                "OPEN": st.column_config.NumberColumn(min_value=0, step=1, disabled=(st.session_state.mode_pick == "missed_close")),
                 "CLOSE": st.column_config.NumberColumn(min_value=0, step=1),
                 "RETRAIT": st.column_config.NumberColumn(min_value=0, step=1),
                 "RESTANT": st.column_config.NumberColumn(disabled=True),
             },
-            key="editor_caisse_t",
         )
-        apply_t = st.form_submit_button("✅ Appliquer (aujourd'hui)")
+        submitted_t = st.form_submit_button("✅ Appliquer (aujourd'hui)")
 
-    if apply_t:
-        merged = merge_commit(st.session_state.base_caisse_today, edited_t, ["OPEN", "CLOSE", "RETRAIT"])
-        if st.session_state.mode_pick == "missed_close":
-            merged["OPEN"] = [clean_int(restant_y.get(k, 0)) for k in DISPLAY_ORDER]
-        st.session_state.base_caisse_today = merged
+    if submitted_t:
+        base = st.session_state.df_caisse_today.copy()
+        cols_to_commit = ["CLOSE", "RETRAIT"] if st.session_state.mode_pick == "missed_close" else ["OPEN", "CLOSE", "RETRAIT"]
+        committed = merge_commit(base, edited_t, cols_to_commit)
+
+        new_retrait = counts_from_df(committed, "RETRAIT")
+        last = dict(st.session_state.last_retrait_t)
+        locks = get_locks(LOCK_T)
+        for denom in DISPLAY_ORDER:
+            if int(new_retrait.get(denom, 0)) != int(last.get(denom, 0)):
+                locks[denom] = int(new_retrait.get(denom, 0))
+        set_locks(LOCK_T, locks)
+        st.session_state.last_retrait_t = new_retrait
+
+        st.session_state.df_caisse_today = committed
+        refresh_caisse_tables()
         st.rerun()
 
-    # Totals (today)
-    open_t = counts_from_df(st.session_state.base_caisse_today, "OPEN")
-    close_t = counts_from_df(st.session_state.base_caisse_today, "CLOSE")
-    retrait_t = counts_from_df(st.session_state.base_caisse_today, "RETRAIT")
-    for k in DISPLAY_ORDER:
-        if retrait_t[k] > close_t[k]:
-            retrait_t[k] = close_t[k]
-    restant_t = {k: max(0, close_t[k] - retrait_t[k]) for k in DISPLAY_ORDER}
+    # totals row under today
+    total_open_t = total_cents_counts(ctx["open_t"])
+    total_close_t = total_cents_counts(ctx["close_t"])
+    total_retrait_t = total_cents_counts(ctx["retrait_t"])
+    total_restant_t = total_cents_counts(ctx["restant_t"])
 
-    total_open = total_cents_counts(open_t)
-    total_close = total_cents_counts(close_t)
-    total_retrait = total_cents_counts(retrait_t)
-    total_restant = total_cents_counts(restant_t)
-
-    st.caption(
-        f"TOTAL OPEN: {cents_to_str(total_open)} | "
-        f"TOTAL CLOSE: {cents_to_str(total_close)} | "
-        f"TOTAL RETRAIT: {cents_to_str(total_retrait)} | "
-        f"TOTAL RESTANT: {cents_to_str(total_restant)}"
-    )
-
-    # Receipt rows
-    rows = []
-    for k in DISPLAY_ORDER:
-        rows.append({
-            "Dénomination": k,
-            "OPEN": int(open_t.get(k, 0)),
-            "CLOSE": int(close_t.get(k, 0)),
-            "RETRAIT": int(retrait_t.get(k, 0)),
-            "RESTANT": int(restant_t.get(k, 0)),
-        })
-    rows.append({
+    total_row_t = pd.DataFrame([{
         "Dénomination": "TOTAL ($)",
-        "OPEN": f"{total_open/100:.2f}",
-        "CLOSE": f"{total_close/100:.2f}",
-        "RETRAIT": f"{total_retrait/100:.2f}",
-        "RESTANT": f"{total_restant/100:.2f}",
+        "OPEN": float(f"{total_open_t/100:.2f}"),
+        "CLOSE": float(f"{total_close_t/100:.2f}"),
+        "RETRAIT": float(f"{total_retrait_t/100:.2f}"),
+        "RESTANT": float(f"{total_restant_t/100:.2f}"),
+    }])
+
+    st.dataframe(total_row_t, use_container_width=True, hide_index=True)
+
+    render_unlock_ui(LOCK_T, "Déverrouiller des coupures (RETRAIT) — AUJOURD'HUI")
+
+    # Build & save receipt (today)
+    rows_today = []
+    dft_now = st.session_state.df_caisse_today.copy()
+    for _, r in dft_now.iterrows():
+        rows_today.append({
+            "Dénomination": r["Dénomination"],
+            "OPEN": int(clean_int(r.get("OPEN", 0))),
+            "CLOSE": int(clean_int(r.get("CLOSE", 0))),
+            "RETRAIT": int(clean_int(r.get("RETRAIT", 0))),
+            "RESTANT": int(clean_int(r.get("RESTANT", 0))),
+        })
+    rows_today.append({
+        "Dénomination": "TOTAL ($)",
+        "OPEN": f"{total_open_t/100:.2f}",
+        "CLOSE": f"{total_close_t/100:.2f}",
+        "RETRAIT": f"{total_retrait_t/100:.2f}",
+        "RESTANT": f"{total_restant_t/100:.2f}",
     })
 
-    meta = {
+    meta_caisse = {
         "Type": "CAISSE",
         "Date": today.isoformat(),
         "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "Caisse #": int(st.session_state.register_no),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Cible $": int(st.session_state.target_dollars),
-        "Mode": mode_labels[st.session_state.mode_pick],
+        "Mode": "Fermeture non effectuée (hier)" if st.session_state.mode_pick == "missed_close" else "Ouverture normale",
     }
 
-    payload = {
-        "meta": meta,
+    payload_caisse = {
+        "meta": meta_caisse,
         "mode_pick": st.session_state.mode_pick,
-        "counts": {
-            "caisse_open_today": open_t,
-            "caisse_close_today": close_t,
-            "caisse_close_yesterday": counts_from_df(st.session_state.base_caisse_yesterday, "CLOSE") if st.session_state.mode_pick == "missed_close" else {k: 0 for k in DISPLAY_ORDER},
-        },
-        "locked_retrait_caisse": retrait_t,
-        "locked_retrait_hier": counts_from_df(st.session_state.base_caisse_yesterday, "RETRAIT") if st.session_state.mode_pick == "missed_close" else {},
-        "rows_today": rows,
+        "df_caisse_today": st.session_state.df_caisse_today.to_dict(orient="records"),
+        "df_caisse_yesterday": st.session_state.df_caisse_yesterday.to_dict(orient="records"),
+        "locks_today": get_locks(LOCK_T),
+        "locks_yesterday": get_locks(LOCK_Y),
+        "last_retrait_t": st.session_state.last_retrait_t,
+        "last_retrait_y": st.session_state.last_retrait_y,
     }
 
     state_path, receipt_path = caisse_paths(today)
-    hc = hash_payload(payload)
+    hc = hash_payload(payload_caisse)
     if st.session_state.last_hash_caisse != hc:
-        html = receipt_html("Reçu — Caisse", meta, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows)
-        save_json(state_path, payload)
+        html = receipt_html("Reçu — Caisse", meta_caisse, ["Dénomination", "OPEN", "CLOSE", "RETRAIT", "RESTANT"], rows_today)
+        save_json(state_path, payload_caisse)
         save_text(receipt_path, html)
         st.session_state.last_hash_caisse = hc
 
-    with st.expander("Aperçu reçu — Caisse", expanded=False):
-        components.html(load_text(receipt_path) or "", height=520, scrolling=True)
+    st.markdown("### Aperçu reçu — Caisse")
+    components.html(load_text(receipt_path) or html, height=520, scrolling=True)
+
+
+# ================== BOÎTE COMPUTE REFRESH ==================
+def refresh_boite_table():
+    dfb = st.session_state.df_boite.copy()
+    for c in ["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"]:
+        if c not in dfb.columns:
+            if c == "Dénomination":
+                dfb[c] = DISPLAY_ORDER
+            else:
+                dfb[c] = 0
+    dfb = dfb[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"]]
+
+    before = counts_from_df(dfb, "OPEN")
+    added = counts_from_df(dfb, "AJOUTÉ")
+
+    after_added = add_counts(before, added)
+    total_added = total_cents_counts(added)
+
+    locks_b = get_locks(LOCK_B)
+
+    withdraw = {k: 0 for k in DISPLAY_ORDER}
+    restant = dict(after_added)
+    remaining = 0
+
+    if total_added > 0:
+        withdraw, remaining = suggest_with_locks(total_added, after_added, PRIORITY_BOITE, locks_b)
+        restant = sub_counts(after_added, withdraw)
+
+    for denom in DISPLAY_ORDER:
+        dfb.loc[dfb["Dénomination"] == denom, "RETRAIT (en change)"] = int(withdraw.get(denom, 0))
+        dfb.loc[dfb["Dénomination"] == denom, "RESTANT"] = int(restant.get(denom, 0))
+
+    st.session_state.df_boite = dfb
+
+    return {
+        "before": before,
+        "added": added,
+        "after_added": after_added,
+        "withdraw": withdraw,
+        "restant": restant,
+        "total_before": total_cents_counts(before),
+        "total_added": total_added,
+        "total_withdraw": total_cents_counts(withdraw),
+        "total_rest": total_cents_counts(restant),
+        "remaining": remaining,
+    }
 
 
 # ================== TAB: BOÎTE ==================
 with tab_boite:
     st.subheader("Boîte (Échange)")
+    st.caption("Colonnes: OPEN / AJOUTÉ / RETRAIT (en change) / RESTANT. Pour forcer une autre combinaison: modifie RETRAIT (mettre 0 = bannir).")
 
-    base_b = st.session_state.base_boite.copy()
-
-    open_b = counts_from_df(base_b, "OPEN")
-    add_b = counts_from_df(base_b, "AJOUTÉ")
-    ret_b = counts_from_df(base_b, "RETRAIT (en change)")
-
-    after_added = {k: open_b[k] + add_b[k] for k in DISPLAY_ORDER}
-    for k in DISPLAY_ORDER:
-        if ret_b[k] > after_added[k]:
-            ret_b[k] = after_added[k]
-    restant_b = {k: max(0, after_added[k] - ret_b[k]) for k in DISPLAY_ORDER}
-
-    dfb = base_b.copy()
-    dfb["RETRAIT (en change)"] = [ret_b[k] for k in DISPLAY_ORDER]
-    dfb["RESTANT"] = [restant_b[k] for k in DISPLAY_ORDER]
+    bctx = refresh_boite_table()
 
     with st.form("form_boite", clear_on_submit=False):
+        dfb_display = st.session_state.df_boite.copy()
         edited_b = st.data_editor(
-            dfb[["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"]],
+            dfb_display,
             use_container_width=True,
             hide_index=True,
-            num_rows="fixed",
-            height=520,
+            key="editor_boite",
             column_config={
                 "Dénomination": st.column_config.TextColumn(disabled=True),
                 "OPEN": st.column_config.NumberColumn(min_value=0, step=1),
@@ -571,87 +757,94 @@ with tab_boite:
                 "RETRAIT (en change)": st.column_config.NumberColumn(min_value=0, step=1),
                 "RESTANT": st.column_config.NumberColumn(disabled=True),
             },
-            key="editor_boite",
         )
-        apply_b = st.form_submit_button("✅ Appliquer (boîte)")
+        submitted_b = st.form_submit_button("✅ Appliquer (boîte)")
 
-    if apply_b:
-        st.session_state.base_boite = merge_commit(
-            st.session_state.base_boite, edited_b, ["OPEN", "AJOUTÉ", "RETRAIT (en change)"]
-        )
+    if submitted_b:
+        base = st.session_state.df_boite.copy()
+        committed = merge_commit(base, edited_b, ["OPEN", "AJOUTÉ", "RETRAIT (en change)"])
+
+        new_retrait = counts_from_df(committed, "RETRAIT (en change)")
+        last = dict(st.session_state.last_retrait_b)
+        locks = get_locks(LOCK_B)
+        for denom in DISPLAY_ORDER:
+            if int(new_retrait.get(denom, 0)) != int(last.get(denom, 0)):
+                locks[denom] = int(new_retrait.get(denom, 0))
+        set_locks(LOCK_B, locks)
+        st.session_state.last_retrait_b = new_retrait
+
+        st.session_state.df_boite = committed
+        refresh_boite_table()
         st.rerun()
 
-    open_b = counts_from_df(st.session_state.base_boite, "OPEN")
-    add_b = counts_from_df(st.session_state.base_boite, "AJOUTÉ")
-    ret_b = counts_from_df(st.session_state.base_boite, "RETRAIT (en change)")
-
-    after_added = {k: open_b[k] + add_b[k] for k in DISPLAY_ORDER}
-    for k in DISPLAY_ORDER:
-        if ret_b[k] > after_added[k]:
-            ret_b[k] = after_added[k]
-    restant_b = {k: max(0, after_added[k] - ret_b[k]) for k in DISPLAY_ORDER}
-
-    tot_open = total_cents_counts(open_b)
-    tot_add = total_cents_counts(add_b)
-    tot_ret = total_cents_counts(ret_b)
-    tot_rest = total_cents_counts(restant_b)
-
-    st.caption(
-        f"TOTAL OPEN: {cents_to_str(tot_open)} | "
-        f"TOTAL AJOUTÉ: {cents_to_str(tot_add)} | "
-        f"TOTAL RETRAIT: {cents_to_str(tot_ret)} | "
-        f"TOTAL RESTANT: {cents_to_str(tot_rest)}"
-    )
-
-    rows = []
-    for k in DISPLAY_ORDER:
-        rows.append({
-            "Dénomination": k,
-            "OPEN": int(open_b.get(k, 0)),
-            "AJOUTÉ": int(add_b.get(k, 0)),
-            "RETRAIT (en change)": int(ret_b.get(k, 0)),
-            "RESTANT": int(restant_b.get(k, 0)),
-        })
-    rows.append({
+    # totals row
+    total_row_b = pd.DataFrame([{
         "Dénomination": "TOTAL ($)",
-        "OPEN": f"{tot_open/100:.2f}",
-        "AJOUTÉ": f"{tot_add/100:.2f}",
-        "RETRAIT (en change)": f"{tot_ret/100:.2f}",
-        "RESTANT": f"{tot_rest/100:.2f}",
+        "OPEN": float(f"{bctx['total_before']/100:.2f}"),
+        "AJOUTÉ": float(f"{bctx['total_added']/100:.2f}"),
+        "RETRAIT (en change)": float(f"{bctx['total_withdraw']/100:.2f}"),
+        "RESTANT": float(f"{bctx['total_rest']/100:.2f}"),
+    }])
+    st.dataframe(total_row_b, use_container_width=True, hide_index=True)
+
+    render_unlock_ui(LOCK_B, "Déverrouiller des coupures (RETRAIT) — BOÎTE")
+
+    # Receipt (boîte)
+    rows_boite = []
+    dfb_now = st.session_state.df_boite.copy()
+    for _, r in dfb_now.iterrows():
+        rows_boite.append({
+            "Dénomination": r["Dénomination"],
+            "OPEN": int(clean_int(r.get("OPEN", 0))),
+            "AJOUTÉ": int(clean_int(r.get("AJOUTÉ", 0))),
+            "RETRAIT (en change)": int(clean_int(r.get("RETRAIT (en change)", 0))),
+            "RESTANT": int(clean_int(r.get("RESTANT", 0))),
+        })
+    rows_boite.append({
+        "Dénomination": "TOTAL ($)",
+        "OPEN": f"{bctx['total_before']/100:.2f}",
+        "AJOUTÉ": f"{bctx['total_added']/100:.2f}",
+        "RETRAIT (en change)": f"{bctx['total_withdraw']/100:.2f}",
+        "RESTANT": f"{bctx['total_rest']/100:.2f}",
     })
 
-    meta = {
+    meta_boite = {
         "Type": "BOÎTE (ÉCHANGE)",
         "Date": today.isoformat(),
         "Généré à": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "Caissier(ère)": (st.session_state.cashier.strip() or "—"),
         "Caisse #": int(st.session_state.register_no),
-        "Ajouté total ($)": f"{tot_add/100:.2f}",
+        "Ajout total ($)": f"{bctx['total_added']/100:.2f}",
     }
 
-    payload = {
-        "meta": meta,
-        "counts": {"boite_open": open_b, "boite_added": add_b},
-        "locked_withdraw_boite": ret_b,
-        "rows": rows,
+    payload_boite = {
+        "meta": meta_boite,
+        "df_boite": st.session_state.df_boite.to_dict(orient="records"),
+        "locks_boite": get_locks(LOCK_B),
+        "last_retrait_b": st.session_state.last_retrait_b,
     }
 
-    state_path, receipt_path = boite_paths(today)
-    hb = hash_payload(payload)
+    state_path_b, receipt_path_b = boite_paths(today)
+    hb = hash_payload(payload_boite)
     if st.session_state.last_hash_boite != hb:
-        html = receipt_html("Reçu — Boîte (Échange)", meta,
-                            ["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"], rows)
-        save_json(state_path, payload)
-        save_text(receipt_path, html)
+        htmlb = receipt_html(
+            "Reçu — Boîte (Échange)",
+            meta_boite,
+            ["Dénomination", "OPEN", "AJOUTÉ", "RETRAIT (en change)", "RESTANT"],
+            rows_boite,
+        )
+        save_json(state_path_b, payload_boite)
+        save_text(receipt_path_b, htmlb)
         st.session_state.last_hash_boite = hb
 
-    with st.expander("Aperçu reçu — Boîte (Échange)", expanded=False):
-        components.html(load_text(receipt_path) or "", height=520, scrolling=True)
+    st.markdown("### Aperçu reçu — Boîte (Échange)")
+    components.html(load_text(receipt_path_b) or htmlb, height=520, scrolling=True)
 
 
-# ================== TAB: SAVE ==================
+# ================== TAB: SAUVEGARDE ==================
 with tab_save:
     st.subheader("Sauvegarde & reçus")
+    st.caption("Clique une date pour voir le reçu détaillé et télécharger les fichiers.")
 
     colA, colB = st.columns(2)
 
@@ -663,19 +856,19 @@ with tab_save:
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
-                sp, rp = caisse_paths(d)
+                state_path, receipt_path = caisse_paths(d)
                 with st.expander(f"{ds} — Reçu Caisse", expanded=False):
-                    html = load_text(rp)
+                    html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    if os.path.exists(rp):
-                        with open(rp, "rb") as f:
-                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp),
-                                               "text/html", key=f"dl_c_html_{ds}")
-                    if os.path.exists(sp):
-                        with open(sp, "rb") as f:
-                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp),
-                                               "application/json", key=f"dl_c_json_{ds}")
+                    else:
+                        st.warning("Reçu introuvable.")
+                    if os.path.exists(receipt_path):
+                        with open(receipt_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_c_html_{ds}")
+                    if os.path.exists(state_path):
+                        with open(state_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(state_path), "application/json", key=f"dl_c_json_{ds}")
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
@@ -685,16 +878,16 @@ with tab_save:
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
-                sp, rp = boite_paths(d)
+                state_path, receipt_path = boite_paths(d)
                 with st.expander(f"{ds} — Reçu Boîte (Échange)", expanded=False):
-                    html = load_text(rp)
+                    html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
-                    if os.path.exists(rp):
-                        with open(rp, "rb") as f:
-                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(rp),
-                                               "text/html", key=f"dl_b_html_{ds}")
-                    if os.path.exists(sp):
-                        with open(sp, "rb") as f:
-                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(sp),
-                                               "application/json", key=f"dl_b_json_{ds}")
+                    else:
+                        st.warning("Reçu introuvable.")
+                    if os.path.exists(receipt_path):
+                        with open(receipt_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger reçu (HTML)", f.read(), os.path.basename(receipt_path), "text/html", key=f"dl_b_html_{ds}")
+                    if os.path.exists(state_path):
+                        with open(state_path, "rb") as f:
+                            st.download_button("⬇️ Télécharger état (JSON)", f.read(), os.path.basename(state_path), "application/json", key=f"dl_b_json_{ds}")
