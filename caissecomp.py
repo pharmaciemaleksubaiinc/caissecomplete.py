@@ -1,12 +1,13 @@
 # caisse_one_table_autosuggest.py
 # Registre — Caisse & Boîte
 # ONE table per tab (no extra result table)
-# - RETRAIT auto-suggested to bring CLOSE down to target
-# - You can override RETRAIT by editing cells in the SAME table
-# - Overrides act like "implicit locks" WITHOUT showing lock columns
-# - Overrides are stored ONLY for rows the user actually edited (fixes "all zeros lock the algo")
-# - If user edits RETRAIT back to the suggested value -> override removed ("unlock")
-# - Fix "Enter resets to 0" by keeping DF + overrides in session_state and not rebuilding them each rerun
+#
+# FIX INCLUDED:
+# ✅ RETRAIT auto-suggest works again (no more “everything locked at 0”)
+# ✅ Overrides are SPARSE: we only store overrides for rows the user actually edited in RETRAIT
+# ✅ Legacy saved overrides (full dict of zeros) are auto-cleaned on load
+# ✅ If user edits RETRAIT back to the suggested value -> override removed (“unlock”)
+# ✅ Editor shows the suggestion-filled df (compute runs before editor uses session df)
 
 import os
 import json
@@ -42,7 +43,7 @@ button[kind="secondary"], button[kind="primary"] { font-weight: 800 !important; 
 div[data-testid="stDataEditor"] { background:#fff !important; border-radius: 10px !important; }
 div[data-testid="stDataEditor"] * { font-size: 14px; }
 
-/* Make table text bolder (Streamlit DOM-targeted) */
+/* Make table text bolder */
 div[data-testid="stDataEditor"] thead * { font-weight: 850 !important; }
 div[data-testid="stDataEditor"] tbody * { font-weight: 650 !important; }
 </style>
@@ -195,7 +196,7 @@ def ensure_df_caisse_today():
         "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
         "OPEN": [0]*len(DISPLAY_ORDER) + [0.0],
         "CLOSE": [0]*len(DISPLAY_ORDER) + [0.0],
-        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # editable override (but we only store overrides on edited rows)
+        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # shown (suggested), can be edited
         "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],   # computed
     })
 
@@ -203,8 +204,8 @@ def ensure_df_caisse_yesterday():
     return pd.DataFrame({
         "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
         "CLOSE": [0]*len(DISPLAY_ORDER) + [0.0],
-        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],   # editable override
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],   # computed
+        "RETRAIT": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],
     })
 
 def ensure_df_boite():
@@ -212,8 +213,8 @@ def ensure_df_boite():
         "Dénomination": DISPLAY_ORDER + [TOTAL_ROW_LABEL],
         "OPEN": [0]*len(DISPLAY_ORDER) + [0.0],
         "AJOUTÉ": [0]*len(DISPLAY_ORDER) + [0.0],
-        "RETRAIT (en change)": [0]*len(DISPLAY_ORDER) + [0.0],  # editable override
-        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],              # computed
+        "RETRAIT (en change)": [0]*len(DISPLAY_ORDER) + [0.0],
+        "RESTANT": [0]*len(DISPLAY_ORDER) + [0.0],
     })
 
 def clamp_override(override: dict, avail: dict) -> dict:
@@ -229,13 +230,12 @@ def clamp_override(override: dict, avail: dict) -> dict:
     return out
 
 def greedy_fill(remaining_cents: int, avail_counts: dict, fixed_counts: dict, priority: list) -> dict:
-    # Start with fixed counts
     out = {k: int(fixed_counts.get(k, 0)) for k in DISPLAY_ORDER}
-    fixed_keys = set(k for k, v in fixed_counts.items() if v is not None)
+    fixed_keys = set(k for k, v in (fixed_counts or {}).items() if v is not None)
 
     rem = remaining_cents - total_cents_from_counts(out)
     if rem <= 0:
-        return out  # already met or over
+        return out
 
     for k in priority:
         if rem <= 0:
@@ -254,7 +254,6 @@ def greedy_fill(remaining_cents: int, avail_counts: dict, fixed_counts: dict, pr
     return out
 
 def compute_caisse_today(df: pd.DataFrame, target_cents: int, overrides: dict):
-    # sanitize inputs
     for col in ["OPEN", "CLOSE", "RETRAIT"]:
         df[col] = df[col].map(safe_int)
 
@@ -268,15 +267,12 @@ def compute_caisse_today(df: pd.DataFrame, target_cents: int, overrides: dict):
         overrides = clamp_override(overrides, close_counts)
         retrait = greedy_fill(diff, close_counts, overrides, PRIORITY_CAISSE)
 
-    # compute restant
     restant = {k: int(close_counts[k]) - int(retrait.get(k, 0)) for k in DISPLAY_ORDER}
 
-    # write back computed
     for k in DISPLAY_ORDER:
         df.loc[df["Dénomination"] == k, "RETRAIT"] = int(retrait.get(k, 0))
         df.loc[df["Dénomination"] == k, "RESTANT"] = int(restant.get(k, 0))
 
-    # totals row ($)
     total_open = total_cents_from_counts(open_counts)
     total_close = total_cents_from_counts(close_counts)
     total_ret = total_cents_from_counts(retrait)
@@ -355,8 +351,24 @@ def compute_boite(df: pd.DataFrame, overrides: dict):
     return open_counts, add_counts, retrait, restant, total_add, leftover, overrides
 
 def idx_to_denom_map(df_display: pd.DataFrame) -> dict:
-    # Streamlit editor_state uses row indices; map them back to denom labels
     return {i: str(df_display.iloc[i]["Dénomination"]) for i in range(len(df_display))}
+
+def cleanup_legacy_overrides(over: dict) -> dict:
+    """
+    Legacy behaviour saved overrides for EVERY denom (often 0),
+    which locks the suggestion algo (because everything becomes fixed_keys).
+    New behaviour: sparse overrides (only what the user edited).
+    """
+    if not isinstance(over, dict):
+        return {}
+    # Drop unknown keys and normalise ints
+    cleaned = {k: safe_int(v) for k, v in over.items() if k in DISPLAY_ORDER}
+
+    # If it's “full dict” and all zeros -> nuke it
+    if len(cleaned) >= len(DISPLAY_ORDER) and all(int(v) == 0 for v in cleaned.values()):
+        return {}
+
+    return cleaned
 
 # ================== AUTH ==================
 st.session_state.setdefault("auth", False)
@@ -384,8 +396,8 @@ st.session_state.setdefault("df_caisse_today", ensure_df_caisse_today())
 st.session_state.setdefault("df_caisse_yesterday", ensure_df_caisse_yesterday())
 st.session_state.setdefault("df_boite", ensure_df_boite())
 
-# Overrides stored separately (invisible to user)
-st.session_state.setdefault("over_caisse_today", {})       # denom -> count (ONLY edited rows)
+# Overrides (sparse)
+st.session_state.setdefault("over_caisse_today", {})
 st.session_state.setdefault("over_caisse_yesterday", {})
 st.session_state.setdefault("over_boite", {})
 
@@ -395,6 +407,7 @@ st.session_state.setdefault("last_hash_boite", None)
 # Load saved once per day
 if st.session_state.get("booted_for") != today.isoformat():
     st.session_state["booted_for"] = today.isoformat()
+
     sp, _ = caisse_paths(today)
     saved = load_json(sp)
     if saved:
@@ -408,15 +421,21 @@ if st.session_state.get("booted_for") != today.isoformat():
             st.session_state.df_caisse_today = pd.DataFrame(saved["df_caisse_today"])
         if "df_caisse_yesterday" in saved:
             st.session_state.df_caisse_yesterday = pd.DataFrame(saved["df_caisse_yesterday"])
-        st.session_state.over_caisse_today = saved.get("over_caisse_today", {}) or {}
-        st.session_state.over_caisse_yesterday = saved.get("over_caisse_yesterday", {}) or {}
+
+        st.session_state.over_caisse_today = cleanup_legacy_overrides(saved.get("over_caisse_today", {}) or {})
+        st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(saved.get("over_caisse_yesterday", {}) or {})
 
     spb, _ = boite_paths(today)
     savedb = load_json(spb)
     if savedb:
         if "df_boite" in savedb:
             st.session_state.df_boite = pd.DataFrame(savedb["df_boite"])
-        st.session_state.over_boite = savedb.get("over_boite", {}) or {}
+        st.session_state.over_boite = cleanup_legacy_overrides(savedb.get("over_boite", {}) or {})
+
+# Always re-clean in case something old is still in session (cheap insurance)
+st.session_state.over_caisse_today = cleanup_legacy_overrides(st.session_state.over_caisse_today)
+st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(st.session_state.over_caisse_yesterday)
+st.session_state.over_boite = cleanup_legacy_overrides(st.session_state.over_boite)
 
 # ================== HEADER ==================
 st.title("Registre — Caisse & Boîte de monnaie")
@@ -428,8 +447,7 @@ with h2:
     st.write("**Heure:**", datetime.now(TZ).strftime("%H:%M"))
 with h3:
     st.session_state.register_no = st.selectbox(
-        "Caisse #",
-        [1, 2, 3],
+        "Caisse #", [1, 2, 3],
         index=[1, 2, 3].index(int(st.session_state.register_no)),
         key="reg_sel",
     )
@@ -437,11 +455,7 @@ with h4:
     st.session_state.cashier = st.text_input("Caissier(ère)", value=st.session_state.cashier, key="cashier_txt")
 
 st.session_state.target_dollars = st.number_input(
-    "Cible à laisser ($)",
-    min_value=0,
-    step=10,
-    value=int(st.session_state.target_dollars),
-    key="target_num",
+    "Cible à laisser ($)", min_value=0, step=10, value=int(st.session_state.target_dollars), key="target_num"
 )
 TARGET = int(st.session_state.target_dollars) * 100
 
@@ -469,20 +483,17 @@ with tab_caisse:
             st.rerun()
     with cB:
         st.caption(
-            "Pour changer la proposition, modifie les chiffres dans RETRAIT (ex: mets 0 sur Billet 100 $). "
-            "L’app recalculera le reste automatiquement. Remets la valeur suggérée pour déverrouiller."
+            "Pour changer la proposition, modifie RETRAIT (ex: mets 0 sur Billet 100 $). "
+            "L’app recalculera le reste. Remets la valeur suggérée pour déverrouiller."
         )
 
     restant_y = {k: 0 for k in DISPLAY_ORDER}
 
-    # ---- Yesterday (only if missed_close). Kept in an expander so you’re not “scrolling forever”.
+    # ---- Yesterday (only if missed_close).
     if st.session_state.mode_pick == "missed_close":
         with st.expander("Hier — fermeture non effectuée", expanded=True):
-
-            # Compute suggestions first so RETRAIT/RESTANT are shown
-            close_y, retrait_y_sugg, restant_y, diff_y, leftover_y, _ = compute_caisse_yesterday(
-                st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
-            )
+            # Compute suggestions first (writes RETRAIT/RESTANT into the session df)
+            compute_caisse_yesterday(st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday)
             df_y_display = st.session_state.df_caisse_yesterday.copy()
 
             edited_y = st.data_editor(
@@ -509,12 +520,12 @@ with tab_caisse:
                     )
                 st.session_state.df_caisse_yesterday = df_store
 
-                # 2) Update overrides ONLY where user actually edited RETRAIT
+                # 2) Update overrides ONLY for rows actually edited in RETRAIT
                 editor_state = st.session_state.get("editor_caisse_y", {})
                 edited_rows = editor_state.get("edited_rows", {}) or {}
                 idx_map = idx_to_denom_map(df_y_display)
 
-                # Recompute suggestions before changing overrides
+                # Suggested based on current overrides BEFORE updating
                 _, suggested_ret_y, _, _, _, _ = compute_caisse_yesterday(
                     st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
                 )
@@ -533,14 +544,12 @@ with tab_caisse:
                         else:
                             overrides.pop(denom, None)
 
-                st.session_state.over_caisse_yesterday = overrides
+                st.session_state.over_caisse_yesterday = cleanup_legacy_overrides(overrides)
 
-                compute_caisse_yesterday(
-                    st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
-                )
+                compute_caisse_yesterday(st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday)
                 st.rerun()
 
-            # Recompute (for status + for prefill OPEN)
+            # Status + restant_y for prefill
             close_y, retrait_y, restant_y, diff_y, leftover_y, _ = compute_caisse_yesterday(
                 st.session_state.df_caisse_yesterday, TARGET, st.session_state.over_caisse_yesterday
             )
@@ -563,11 +572,8 @@ with tab_caisse:
 
     st.markdown("### Aujourd'hui")
 
-    # Compute suggestions first so RETRAIT is auto-suggested in the editor
-    open_t, close_t, retrait_t, restant_t, diff_t, leftover_t, _ = compute_caisse_today(
-        st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
-    )
-
+    # Compute suggestions first so editor shows them
+    compute_caisse_today(st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today)
     df_t_display = st.session_state.df_caisse_today.copy()
 
     disabled_cols = ["Dénomination", "RESTANT"]
@@ -603,12 +609,12 @@ with tab_caisse:
             )
         st.session_state.df_caisse_today = df_store
 
-        # 2) Update overrides ONLY for RETRAIT rows that user edited
+        # 2) Overrides only where user actually edited RETRAIT
         editor_state = st.session_state.get("editor_caisse_t", {})
         edited_rows = editor_state.get("edited_rows", {}) or {}
         idx_map = idx_to_denom_map(df_t_display)
 
-        # Suggestions before updating overrides
+        # Suggested before updating overrides
         _, _, suggested_ret, _, _, _, _ = compute_caisse_today(
             st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
         )
@@ -627,15 +633,22 @@ with tab_caisse:
                 else:
                     overrides.pop(denom, None)
 
-        st.session_state.over_caisse_today = overrides
+        st.session_state.over_caisse_today = cleanup_legacy_overrides(overrides)
 
         # 3) Final compute writes RETRAIT/RESTANT + totals
         compute_caisse_today(st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today)
         st.rerun()
 
-    # Recompute for status + receipt building
+    # Recompute for status + receipt
     open_t, close_t, retrait_t, restant_t, diff_t, leftover_t, _ = compute_caisse_today(
         st.session_state.df_caisse_today, TARGET, st.session_state.over_caisse_today
+    )
+
+    # Debug line (helps instantly if you think “it’s not suggesting”)
+    st.caption(
+        f"DEBUG — CLOSE total: {total_cents_from_counts(close_t)/100:.2f}$ | "
+        f"Target: {TARGET/100:.2f}$ | Diff: {diff_t/100:.2f}$ | "
+        f"Overrides: {len(st.session_state.over_caisse_today)}"
     )
 
     if diff_t <= 0:
@@ -709,13 +722,11 @@ with tab_boite:
     with cB:
         st.caption(
             "Modifie RETRAIT (en change) pour forcer une répartition. "
-            "L’app recalculera le reste automatiquement. Remets la valeur suggérée pour déverrouiller."
+            "L’app recalculera le reste. Remets la valeur suggérée pour déverrouiller."
         )
 
-    # Compute suggestions first so RETRAIT (en change) is auto-suggested in the editor
-    open_b, add_b, ret_b_sugg, res_b, total_add, leftover_b, _ = compute_boite(
-        st.session_state.df_boite, st.session_state.over_boite
-    )
+    # Compute suggestions first so editor shows them
+    compute_boite(st.session_state.df_boite, st.session_state.over_boite)
     df_b_display = st.session_state.df_boite.copy()
 
     edited_b = st.data_editor(
@@ -735,7 +746,7 @@ with tab_boite:
     )
 
     if st.button("✅ Appliquer (boîte)", use_container_width=True, key="apply_b"):
-        # 1) Commit OPEN + AJOUTÉ (don’t blindly commit RETRAIT)
+        # 1) Commit OPEN + AJOUTÉ
         df_store = st.session_state.df_boite.copy()
         for k in DISPLAY_ORDER:
             df_store.loc[df_store["Dénomination"] == k, "OPEN"] = safe_int(
@@ -746,12 +757,12 @@ with tab_boite:
             )
         st.session_state.df_boite = df_store
 
-        # 2) Update overrides ONLY for rows edited in RETRAIT (en change)
+        # 2) Overrides only for rows actually edited in RETRAIT (en change)
         editor_state = st.session_state.get("editor_boite", {})
         edited_rows = editor_state.get("edited_rows", {}) or {}
         idx_map = idx_to_denom_map(df_b_display)
 
-        # Suggestions before updating overrides
+        # Suggested before updating overrides
         _, _, suggested_ret_b, _, _, _, _ = compute_boite(st.session_state.df_boite, st.session_state.over_boite)
 
         overrides = dict(st.session_state.over_boite)
@@ -768,12 +779,12 @@ with tab_boite:
                 else:
                     overrides.pop(denom, None)
 
-        st.session_state.over_boite = overrides
+        st.session_state.over_boite = cleanup_legacy_overrides(overrides)
 
         compute_boite(st.session_state.df_boite, st.session_state.over_boite)
         st.rerun()
 
-    # Recompute for status + receipt building
+    # Recompute for status + receipt
     open_b, add_b, ret_b, res_b, total_add, leftover_b, _ = compute_boite(
         st.session_state.df_boite, st.session_state.over_boite
     )
