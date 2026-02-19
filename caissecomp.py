@@ -865,15 +865,51 @@ with tab_boite:
 with tab_save:
     st.subheader("Sauvegarde & reçus")
 
-    def list_dates(folder: str):
-        files = sorted([f for f in os.listdir(folder) if f.endswith("_state.json")])
-        return [f.replace("_state.json", "") for f in files]
+    def list_dates_caisse(folder: str):
+        """
+        Caisse files are now: YYYY-MM-DD_caisse{n}_state.json
+        We extract the date from the first 10 chars, and return unique sorted dates.
+        """
+        dates = set()
+        for f in os.listdir(folder):
+            if not f.endswith("_state.json"):
+                continue
+            if len(f) < 10:
+                continue
+            # First 10 chars are expected to be YYYY-MM-DD
+            ds = f[:10]
+            try:
+                date.fromisoformat(ds)
+                dates.add(ds)
+            except ValueError:
+                continue
+        return sorted(dates)
+
+    def list_dates_boite(folder: str):
+        """
+        Boîte files are: YYYY-MM-DD_state.json
+        We extract the date from the first 10 chars too (safe + consistent).
+        """
+        dates = set()
+        for f in os.listdir(folder):
+            if not f.endswith("_state.json"):
+                continue
+            if len(f) < 10:
+                continue
+            ds = f[:10]
+            try:
+                date.fromisoformat(ds)
+                dates.add(ds)
+            except ValueError:
+                continue
+        return sorted(dates)
 
     colA, colB = st.columns(2)
 
     with colA:
         st.markdown("## 📒 Caisses (1–3)")
-        dates = list_dates(DIR_CAISSE)
+
+        dates = list_dates_caisse(DIR_CAISSE)
         if not dates:
             st.info("Aucun enregistrement Caisse.")
         else:
@@ -882,6 +918,8 @@ with tab_save:
 
                 for reg in (1, 2, 3):
                     state_path, receipt_path = caisse_paths(d, reg)
+
+                    # Skip if nothing exists for that register on that date
                     if not os.path.exists(state_path) and not os.path.exists(receipt_path):
                         continue
 
@@ -899,6 +937,7 @@ with tab_save:
                                     "text/html",
                                     key=f"dl_c_html_{ds}_{reg}",
                                 )
+
                         if os.path.exists(state_path):
                             with open(state_path, "rb") as f:
                                 st.download_button(
@@ -911,17 +950,20 @@ with tab_save:
 
     with colB:
         st.markdown("## 🪙 Boîte (Échange)")
-        dates = list_dates(DIR_BOITE)
+
+        dates = list_dates_boite(DIR_BOITE)
         if not dates:
             st.info("Aucun enregistrement Boîte.")
         else:
             for ds in reversed(dates):
                 d = date.fromisoformat(ds)
                 state_path, receipt_path = boite_paths(d)
+
                 with st.expander(f"{ds} — Reçu Boîte (Échange)", expanded=False):
                     html = load_text(receipt_path)
                     if html:
                         components.html(html, height=650, scrolling=True)
+
                     if os.path.exists(receipt_path):
                         with open(receipt_path, "rb") as f:
                             st.download_button(
@@ -931,6 +973,7 @@ with tab_save:
                                 "text/html",
                                 key=f"dl_b_html_{ds}",
                             )
+
                     if os.path.exists(state_path):
                         with open(state_path, "rb") as f:
                             st.download_button(
